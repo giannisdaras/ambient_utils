@@ -134,3 +134,104 @@ def get_box_mask_that_fits(image_shape, survival_probability, device='cuda'):
     mask[inside_box] = 1.0
     
     return 1 - mask
+
+
+def keep_center(image, keep_ratio=0.5, keep_original_size=False):
+    """
+        Keeps the center of the image, discarding the rest.
+        Args:
+            image: (batch_size, num_channels, height, width)
+            keep_ratio: ratio of the image to keep
+            keep_original_size: if True, the image will be upscaled to the original size
+        Returns:
+            image: 
+                (batch_size, num_channels, height * keep_ratio, width * keep_ratio) if keep_original_size is False
+                (batch_size, num_channels, height, width) if keep_original_size is True
+    """
+    batch_size = image.shape[0]
+    num_channels = image.shape[1]
+    height = image.shape[2]
+    width = image.shape[3]
+    new_height = int(height * keep_ratio)
+    new_width = int(width * keep_ratio)
+    start_row = (height - new_height) // 2
+    start_col = (width - new_width) // 2
+    if keep_original_size:
+        return torch.nn.functional.interpolate(image[:, :, start_row:start_row + new_height, start_col:start_col + new_width], size=(height, width))
+    else:
+        return image[:, :, start_row:start_row + new_height, start_col:start_col + new_width]
+
+    
+def shift_image_with_real_data_left_or_right(ambient_image, real_image, keep_ratio, shift_ratio=0.5, shift_left=True):
+    """
+        Shifts the real image to the left or right and returns the result.
+        Args:
+            ambient_image: (batch_size, num_channels, ambient_height, ambient_width)
+            real_image: (batch_size, num_channels, real_height, real_width)
+            keep_ratio: ratio of center crop of ambient image
+            shift_ratio: ratio of the image to shift
+            shift_left: if True, the image will be shifted to the left, otherwise to the right
+    """
+
+    _, _, ambient_height, ambient_width = ambient_image.shape
+    _, _, real_height, real_width = real_image.shape
+    num_pixels_to_shift = int(shift_ratio * real_width)
+
+    assert ambient_width <= real_width - 2 * num_pixels_to_shift, "The real image should have enough data to shift the ambient image."
+    assert int(real_height * keep_ratio) == ambient_height, "Keep ratio is not set correctly."
+    assert int(real_width * keep_ratio) == ambient_width, "Keep ratio is not set correctly."
+
+    if shift_left:
+        # shift real image to the left
+        shifted_real_image = real_image[:, :, :, :-num_pixels_to_shift]
+        # pad to its original size
+        shifted_real_image = torch.nn.functional.pad(shifted_real_image, (num_pixels_to_shift, 0, 0, 0))
+    else:
+        # shift real image to the right
+        shifted_real_image = real_image[:, :, :, num_pixels_to_shift:]
+        # pad to its original size
+        shifted_real_image = torch.nn.functional.pad(shifted_real_image, (0, num_pixels_to_shift, 0, 0))   
+    shifted = keep_center(shifted_real_image, keep_ratio)
+    cloned_ambient_image = torch.clone(ambient_image)
+    if shift_left:
+        cloned_ambient_image[:, :, :, -shifted.shape[3]:] = shifted
+    else:
+        cloned_ambient_image[:, :, :, :shifted.shape[3]] = shifted
+    return cloned_ambient_image
+
+def shift_image_with_real_data_up_or_down(ambient_image, real_image, keep_ratio, shift_ratio=0.5, shift_up=True):
+    """
+        Shifts the real image up or down and returns the result.
+        Args:
+            ambient_image: (batch_size, num_channels, ambient_height, ambient_width)
+            real_image: (batch_size, num_channels, real_height, real_width)
+            keep_ratio: ratio of center crop of ambient image
+            shift_ratio: ratio of the image to shift
+            shift_up: if True, the image will be shifted up, otherwise down
+    """
+
+    _, _, ambient_height, ambient_width = ambient_image.shape
+    _, _, real_height, real_width = real_image.shape
+    num_pixels_to_shift = int(shift_ratio * real_height)
+
+    assert ambient_height <= real_height - 2 * num_pixels_to_shift, "The real image should have enough data to shift the ambient image."
+    assert int(real_height * keep_ratio) == ambient_height, "Keep ratio is not set correctly."
+    assert int(real_width * keep_ratio) == ambient_width, "Keep ratio is not set correctly."
+
+    if shift_up:
+        # shift real image to the left
+        shifted_real_image = real_image[:, :, :-num_pixels_to_shift, :]
+        # pad to its original size
+        shifted_real_image = torch.nn.functional.pad(shifted_real_image, (0, 0, num_pixels_to_shift, 0))
+    else:
+        # shift real image to the right
+        shifted_real_image = real_image[:, :, num_pixels_to_shift:, :]
+        # pad to its original size
+        shifted_real_image = torch.nn.functional.pad(shifted_real_image, (0, 0, 0, num_pixels_to_shift))   
+    shifted = keep_center(shifted_real_image, keep_ratio)
+    cloned_ambient_image = torch.clone(ambient_image)
+    if shift_up:
+        cloned_ambient_image[:, :, -shifted.shape[2]:, :] = shifted
+    else:
+        cloned_ambient_image[:, :, :shifted.shape[2], :] = shifted
+    return cloned_ambient_image

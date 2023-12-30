@@ -2,6 +2,7 @@ import torch
 from torchvision import transforms
 import PIL
 import numpy as np
+import wandb
 
 def load_image(image_obj, device='cuda', resolution=None):
     if type(image_obj) == str:
@@ -17,15 +18,21 @@ def load_image(image_obj, device='cuda', resolution=None):
     tensor_image = transform(pil_image)
     return torch.unsqueeze(tensor_image, 0).to(device)
 
-def save_image(images, image_path):
+def save_image(images, image_path, save_wandb=False):
     image_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
     if image_np.shape[2] == 1:
-        PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
+        pil_image = PIL.Image.fromarray(image_np[:, :, 0], 'L')
+        pil_image.save(image_path)
     else:
-        PIL.Image.fromarray(image_np, 'RGB').save(image_path)
+        pil_image = PIL.Image.fromarray(image_np, 'RGB')
+        pil_image.save(image_path)
+
+    if save_wandb:
+        wandb.log({"images/" + image_path.split("/")[-1]: wandb.Image(pil_image)})
 
 
-def save_images(images, image_path, num_rows=None, num_cols=None):
+
+def save_images(images, image_path, num_rows=None, num_cols=None, save_wandb=False):
     if num_rows is None:
         num_rows = int(np.sqrt(images.shape[0]))
     if num_cols is None:
@@ -41,6 +48,9 @@ def save_images(images, image_path, num_rows=None, num_cols=None):
             img = PIL.Image.fromarray(image_np[index])
             grid_image.paste(img, (i * image_size, j * image_size))
     grid_image.save(image_path)
+
+    if save_wandb:
+        wandb.log({"images/" + image_path.split("/")[-1]: wandb.Image(grid_image)})
 
 
 def tile_image(batch_image, n, m=None):

@@ -3,6 +3,8 @@ from torchvision import transforms
 import PIL
 import numpy as np
 import wandb
+from . import dataset_utils
+
 
 def load_image(image_obj, device='cuda', resolution=None):
     if type(image_obj) == str:
@@ -18,7 +20,7 @@ def load_image(image_obj, device='cuda', resolution=None):
     tensor_image = transform(pil_image)
     return torch.unsqueeze(tensor_image, 0).to(device)
 
-def save_image(images, image_path, save_wandb=False):
+def save_image(images, image_path, save_wandb=False, wandb_down_factor=4):
     image_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
     if image_np.shape[2] == 1:
         pil_image = PIL.Image.fromarray(image_np[:, :, 0], 'L')
@@ -28,11 +30,14 @@ def save_image(images, image_path, save_wandb=False):
         pil_image.save(image_path)
 
     if save_wandb:
+        if wandb_down_factor is not None:
+            # resize for speed
+            pil_image = pil_image.resize((pil_image.size[0] // wandb_down_factor, pil_image.size[1] // wandb_down_factor))
         wandb.log({"images/" + image_path.split("/")[-1]: wandb.Image(pil_image)})
 
 
 
-def save_images(images, image_path, num_rows=None, num_cols=None, save_wandb=False):
+def save_images(images, image_path, num_rows=None, num_cols=None, save_wandb=False, wandb_down_factor=None):
     if num_rows is None:
         num_rows = int(np.sqrt(images.shape[0]))
     if num_cols is None:
@@ -50,6 +55,9 @@ def save_images(images, image_path, num_rows=None, num_cols=None, save_wandb=Fal
     grid_image.save(image_path)
 
     if save_wandb:
+        if wandb_down_factor is not None:
+            # resize for speed
+            grid_image = grid_image.resize((grid_image.size[0] // wandb_down_factor, grid_image.size[1] // wandb_down_factor))
         wandb.log({"images/" + image_path.split("/")[-1]: wandb.Image(grid_image)})
 
 

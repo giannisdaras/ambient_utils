@@ -240,4 +240,23 @@ def animate_image_rotation_around_center(image, keep_ratio=0.7, rotation_radius=
     return images
 
 
+def move_random_direction(image, keep_ratio=0.7, max_radius=0.1, return_shift_params=True):
+    """
+        Moves the image in a random direction.
+        Args:
+            image: (batch_size, num_channels, height, width)
+            keep_ratio: ratio of the image to keep
+            max_radius: ratio of the image to shift
+            num_steps: number of steps to animate
+    """
+    centered_image = keep_center(image, keep_ratio)
+    random_angles = np.random.uniform(0, 2 * np.pi, size=(image.shape[0],))
+    random_radii = np.random.uniform(0, max_radius, size=(image.shape[0],))
+    left_shift_ratio = torch.tensor(random_radii * np.sin(random_angles), device=image.device)
+    top_shift_ratio = torch.tensor(random_radii * np.cos(random_angles), device=image.device)
+    left_shifted, real_shifted = shift_image_with_real_data_left_or_right(centered_image, image, keep_ratio, shift_ratio=left_shift_ratio, shift_left=True, return_shifted=True)
+    final_shifted = shift_image_with_real_data_up_or_down(left_shifted, real_shifted, keep_ratio, shift_ratio=top_shift_ratio, shift_up=False)
+    if return_shift_params:
+        return final_shifted, left_shift_ratio, top_shift_ratio
+    return final_shifted
 

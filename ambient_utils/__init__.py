@@ -3,7 +3,66 @@ from torchvision import transforms
 import PIL
 import numpy as np
 import wandb
-from . import dataset_utils
+import imageio
+
+# vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None, revision=args.revision, variant=args.variant,)
+# vae = vae.cuda().to(torch.float32)
+# image_pred = vae.decode(xn_pred / vae.config.scaling_factor, return_dict=False)[0]
+# ambient_utils.save_image(image_pred[0], "image_pred.png")
+
+def broadcast_batch_tensor(batch_tensor):
+    """ Takes a tensor of potential shape (batch_size) and returns a tensor of shape (batch_size, 1, 1, 1).
+    """
+    return batch_tensor.view(-1, 1, 1, 1)
+
+def get_mean_loss(loss, mask=None):
+    """ Computes the mean loss over the batch.
+        Args:
+            loss: (batch_size, num_channels, height, width)
+            mask: (batch_size, num_channels, height, width) or (batch_size)
+        Returns:
+            mean_loss: scalar tensor.
+    """
+    if mask is None:
+        return loss.mean()
+    else:
+        # squeeze the mask if it is of shape (batch_size, 1, 1, 1)
+        mask = mask.squeeze()
+    if len(mask.shape) == 1:
+        mask = mask.repeat([1, loss.shape[1], loss.shape[2], loss.shape[3]])
+    loss = loss.sum() / mask.sum()
+    return loss
+
+def from_noise_pred_to_x0_pred_vp(noisy_input, noise_pred, sigma):
+    sigma = broadcast_batch_tensor(sigma)
+    return (noisy_input - sigma * noise_pred) / torch.sqrt(1 - sigma ** 2)
+
+def from_x0_pred_to_xnature_pred_vp_to_vp(x0_pred, noisy_input, current_sigma, desired_sigma):
+    current_sigma, desired_sigma = [broadcast_batch_tensor(x) for x in [current_sigma, desired_sigma]]
+    scaling_coeff = torch.sqrt((1 - desired_sigma**2) / (1 - current_sigma ** 2))
+    noise_coeff = torch.sqrt(desired_sigma ** 2 - (scaling_coeff ** 2) * current_sigma ** 2)
+    return ((noise_coeff / desired_sigma) ** 2 * (torch.sqrt(1 - desired_sigma ** 2) * x0_pred - noisy_input) + noisy_input) / scaling_coeff
+
+def add_extra_noise_from_vp_to_vp(noisy_input, current_sigma, desired_sigma):
+    """
+        Adds extra noise to the input to move from current_sigma to desired_sigma.
+        Args:
+            noisy_input: input to add noise to
+            current_sigma: current noise level
+            desired_sigma: desired noise level
+        Returns:
+            extra_noisy: noisy input with extra noise
+            noise_realization: the noise realization that was added
+            done: True if the desired noise level was reached, False otherwise
+    """
+    scaling_coeff = torch.sqrt((1 - desired_sigma**2) / (1 - current_sigma ** 2))
+    noise_coeff = torch.sqrt(desired_sigma ** 2 - (scaling_coeff ** 2) * current_sigma ** 2)
+    noise_realization = torch.randn_like(noisy_input)
+    scaling_coeff, noise_coeff, current_sigma, desired_sigma = [broadcast_batch_tensor(x) for x in [scaling_coeff, noise_coeff, current_sigma, desired_sigma]]
+    extra_noisy = scaling_coeff * noisy_input + noise_coeff * noise_realization
+    # when we are trying to move to a lower noise level, just do nothing
+    extra_noisy = torch.where(current_sigma > desired_sigma, noisy_input, extra_noisy)
+    return extra_noisy, noise_realization, current_sigma <= desired_sigma
 
 
 def load_image(image_obj, device='cuda', resolution=None):

@@ -53,10 +53,12 @@ class Dataset(torch.utils.data.Dataset):
         corruption_pattern = "dust",
         ratios = [1.0, 0.8, 0.6, 0.4, 0.2, 0.1],  # potential downsampling ratios,
         normalize=True,
-        sigma=0.0
+        sigma=0.0,
+        noise_type="ve",
     ):
         assert corruption_pattern in ["dust", "box", "fixed_box", "keep_patch"], \
             "corruption_pattern must be either 'dust', 'box', 'keep_patch', or 'fixed_box'"
+        assert noise_type in ["ve", "vp"], "noise_type must be either 've' or 'vp'"
         self._name = name
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
@@ -71,6 +73,7 @@ class Dataset(torch.utils.data.Dataset):
         self.ratios = ratios
         self.normalize = normalize
         self.sigma = sigma
+        self.noise_type = noise_type
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
@@ -139,8 +142,12 @@ class Dataset(torch.utils.data.Dataset):
             # image = image.astype(np.float32) / 127.5 - 1
             image = image.astype(np.float32) / 255.0
         
-        image += self.sigma * np.random.normal(size=image.shape)
-        
+        if self.noise_type == "ve":
+            image += self.sigma * np.random.normal(size=image.shape)
+        elif self.noise_type == "vp":
+            image = np.sqrt(1 - self.sigma**2) * image + self.sigma * np.random.normal(size=image.shape)
+        else:
+            raise NotImplementedError(f"Noise type {self.noise_type} not implemented.")
 
         if self.corruption_pattern == "dust":                
             if self.mask_full_rgb:
@@ -148,10 +155,8 @@ class Dataset(torch.utils.data.Dataset):
                 corruption_mask = corruption_mask[np.newaxis, :, :].repeat(image.shape[0], axis=0)
                 extra_mask = np.random.binomial(1, 1 - self.delta_probability, size=image.shape[1:]).astype(np.float32)
                 extra_mask = extra_mask[np.newaxis, :, :].repeat(image.shape[0], axis=0)
-                hat_corruption_mask = np.minimum(corruption_mask, extra_mask)
             else:
                 corruption_mask = np.random.binomial(1, 1 - self.corruption_probability, size=image.shape).astype(np.float32)
-                hat_corruption_mask = np.minimum(corruption_mask, np.random.binomial(1, 1 - self.delta_probability, size=image.shape).astype(np.float32))
         else:
             raise NotImplementedError("Corruption pattern not implemented")
         

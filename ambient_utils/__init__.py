@@ -4,6 +4,8 @@ import PIL
 import numpy as np
 import wandb
 import imageio
+from . import dataset_utils, geom_utils, diffusers_utils
+import math
 
 # vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None, revision=args.revision, variant=args.variant,)
 # vae = vae.cuda().to(torch.float32)
@@ -25,23 +27,34 @@ def get_mean_loss(loss, mask=None):
     """
     if mask is None:
         return loss.mean()
-    else:
-        # squeeze the mask if it is of shape (batch_size, 1, 1, 1)
-        mask = mask.squeeze()
+        
     if len(mask.shape) == 1:
-        mask = mask.repeat([1, loss.shape[1], loss.shape[2], loss.shape[3]])
+        mask = mask.repeat([1, loss.shape[1], loss.shape[2], loss.shape[3]])    
+    
+    if mask.sum() == 0:
+        return loss.sum() * mask.sum()
     loss = loss.sum() / mask.sum()
     return loss
+
+
+def ambient_sqrt(x):
+    """
+        Computes the square root of x if x is positive, and 1 otherwise.
+    """
+    return torch.where(x < 0, torch.ones_like(x), x.sqrt())
+
 
 def from_noise_pred_to_x0_pred_vp(noisy_input, noise_pred, sigma):
     sigma = broadcast_batch_tensor(sigma)
     return (noisy_input - sigma * noise_pred) / torch.sqrt(1 - sigma ** 2)
 
+
 def from_x0_pred_to_xnature_pred_vp_to_vp(x0_pred, noisy_input, current_sigma, desired_sigma):
     current_sigma, desired_sigma = [broadcast_batch_tensor(x) for x in [current_sigma, desired_sigma]]
-    scaling_coeff = torch.sqrt((1 - desired_sigma**2) / (1 - current_sigma ** 2))
-    noise_coeff = torch.sqrt(desired_sigma ** 2 - (scaling_coeff ** 2) * current_sigma ** 2)
-    return ((noise_coeff / desired_sigma) ** 2 * (torch.sqrt(1 - desired_sigma ** 2) * x0_pred - noisy_input) + noisy_input) / scaling_coeff
+    scaling_coeff = ambient_sqrt((1 - desired_sigma**2) / (1 - current_sigma ** 2))
+    noise_coeff = ambient_sqrt(desired_sigma ** 2 - (scaling_coeff ** 2) * current_sigma ** 2)
+    return ((noise_coeff / desired_sigma) ** 2 * (ambient_sqrt(1 - desired_sigma ** 2) * x0_pred - noisy_input) + noisy_input) / scaling_coeff
+
 
 def add_extra_noise_from_vp_to_vp(noisy_input, current_sigma, desired_sigma):
     """
@@ -55,14 +68,14 @@ def add_extra_noise_from_vp_to_vp(noisy_input, current_sigma, desired_sigma):
             noise_realization: the noise realization that was added
             done: True if the desired noise level was reached, False otherwise
     """
-    scaling_coeff = torch.sqrt((1 - desired_sigma**2) / (1 - current_sigma ** 2))
-    noise_coeff = torch.sqrt(desired_sigma ** 2 - (scaling_coeff ** 2) * current_sigma ** 2)
+    scaling_coeff = ambient_sqrt((1 - desired_sigma**2) / (1 - current_sigma ** 2))
+    noise_coeff = ambient_sqrt(desired_sigma ** 2 - (scaling_coeff ** 2) * current_sigma ** 2)
     noise_realization = torch.randn_like(noisy_input)
     scaling_coeff, noise_coeff, current_sigma, desired_sigma = [broadcast_batch_tensor(x) for x in [scaling_coeff, noise_coeff, current_sigma, desired_sigma]]
     extra_noisy = scaling_coeff * noisy_input + noise_coeff * noise_realization
     # when we are trying to move to a lower noise level, just do nothing
     extra_noisy = torch.where(current_sigma > desired_sigma, noisy_input, extra_noisy)
-    return extra_noisy, noise_realization, current_sigma <= desired_sigma
+    return extra_noisy, noise_realization, (current_sigma <= desired_sigma)[:, 0, 0, 0]
 
 
 def load_image(image_obj, device='cuda', resolution=None):
@@ -79,14 +92,24 @@ def load_image(image_obj, device='cuda', resolution=None):
     tensor_image = transform(pil_image)
     return torch.unsqueeze(tensor_image, 0).to(device)
 
-def save_image(images, image_path, save_wandb=False, wandb_down_factor=4):
+def save_image(images, image_path, save_wandb=False, down_factor=None, wandb_down_factor=None, 
+               caption=None, font_size=40, text_color=(255, 255, 255)):
     image_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
     if image_np.shape[2] == 1:
         pil_image = PIL.Image.fromarray(image_np[:, :, 0], 'L')
-        pil_image.save(image_path)
     else:
         pil_image = PIL.Image.fromarray(image_np, 'RGB')
-        pil_image.save(image_path)
+    if down_factor is not None:
+        pil_image = pil_image.resize((pil_image.size[0] // down_factor, pil_image.size[1] // down_factor))
+    
+    if caption is not None:
+        draw = PIL.ImageDraw.Draw(pil_image)
+        # use LaTeX bold font
+        font = PIL.ImageFont.truetype("cmr10.ttf", font_size)
+        # make bold
+        draw.text((0, 0), caption, text_color, font=font)
+
+    pil_image.save(image_path)
 
     if save_wandb:
         if wandb_down_factor is not None:
@@ -95,14 +118,31 @@ def save_image(images, image_path, save_wandb=False, wandb_down_factor=4):
         wandb.log({"images/" + image_path.split("/")[-1]: wandb.Image(pil_image)})
 
 
+def find_closest_factors(number):
+    sqrt_number = int(math.sqrt(number))
+    
+    n = sqrt_number
+    m = number // n
+    
+    while n * m != number:
+        n += 1
+        m = number // n
 
-def save_images(images, image_path, num_rows=None, num_cols=None, save_wandb=False, wandb_down_factor=None):
-    if num_rows is None:
-        num_rows = int(np.sqrt(images.shape[0]))
-    if num_cols is None:
+    return m, n
+
+def save_images(images, image_path, num_rows=None, num_cols=None, save_wandb=False, down_factor=None, wandb_down_factor=None, 
+                captions=None, font_size=40, text_color=(255, 255, 255), draw_horizontal_arrow=False, draw_vertical_arrow=False):
+    if num_rows is None and num_cols is None:
+        num_rows = int(np.sqrt(images.shape[0]))    
+        num_cols = int(np.ceil(images.shape[0] / num_rows))
+    elif num_rows is None and num_cols is not None:
+        num_rows = int(np.ceil(images.shape[0] / num_cols))
+    elif num_rows is not None and num_cols is None:
         num_cols = int(np.ceil(images.shape[0] / num_rows))
     
-    # TODO(giannisdaras): only works with square grids
+    if num_rows * num_cols != images.shape[0]:
+        num_rows, num_cols = find_closest_factors(images.shape[0])
+    
     image_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
     image_size = images.shape[-2]
     grid_image = PIL.Image.new('RGB', (num_cols * image_size, num_rows * image_size))
@@ -110,7 +150,25 @@ def save_images(images, image_path, num_rows=None, num_cols=None, save_wandb=Fal
         for j in range(num_cols):
             index = i * num_cols + j
             img = PIL.Image.fromarray(image_np[index])
-            grid_image.paste(img, (i * image_size, j * image_size))
+            grid_image.paste(img, (j * image_size, i * image_size))
+            if captions is not None:
+                draw = PIL.ImageDraw.Draw(grid_image)
+                # use LaTeX bold font
+                font = PIL.ImageFont.truetype("cmr10.ttf", font_size)
+                draw.text((j * image_size, i * image_size), captions[index], text_color, font=font)
+    if down_factor is not None:
+        grid_image = grid_image.resize((grid_image.size[0] // down_factor, grid_image.size[1] // down_factor))
+    
+    if draw_horizontal_arrow:
+        draw = PIL.ImageDraw.Draw(grid_image)
+        # draw it on the top of the image
+        draw.line((0, 0, grid_image.size[0], 0), fill=(255, 0, 0), width=5)
+
+    if draw_vertical_arrow:
+        draw = PIL.ImageDraw.Draw(grid_image)
+        # draw it on the left of the image
+        draw.line((0, 0, 0, grid_image.size[1]), fill=(255, 0, 0), width=5)
+
     grid_image.save(image_path)
 
     if save_wandb:
@@ -118,6 +176,8 @@ def save_images(images, image_path, num_rows=None, num_cols=None, save_wandb=Fal
             # resize for speed
             grid_image = grid_image.resize((grid_image.size[0] // wandb_down_factor, grid_image.size[1] // wandb_down_factor))
         wandb.log({"images/" + image_path.split("/")[-1]: wandb.Image(grid_image)})
+
+
 
 
 def tile_image(batch_image, n, m=None):
@@ -213,13 +273,28 @@ def get_box_mask_that_fits(image_shape, survival_probability, device='cuda'):
     return 1 - mask
 
 
+
+
 def create_video_from_frames(frames, video_path, fps=25):
     """
         Creates a video from frames.
         Args:
-            frames: (num_frames, num_channels, height, width)
+            frames: (batch_size, num_frames, num_channels, height, width)
             video_path: path to save the video
             fps: frames per second
     """
-    frames = (frames * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
-    imageio.mimwrite(video_path, frames, fps=fps)
+    def _create_video_from_frames(frames, video_path, fps=25):
+        frames = (frames * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+        imageio.mimwrite(video_path, frames, fps=fps)
+    batch_size = frames.shape[0]
+    tiled_frames = [tile_image(frame, n=batch_size, m=1) for frame in frames.permute(1, 0, 2, 3, 4)]
+    tiled_frames = torch.stack(tiled_frames, dim=0)
+    _create_video_from_frames(tiled_frames, video_path, fps=fps)
+
+
+def get_rel_methods(obj, keyword):
+    """Returns all methods/properties of obj that contain keyword in their name.
+    """
+    return [attr for attr in dir(obj) if keyword in attr]
+
+    

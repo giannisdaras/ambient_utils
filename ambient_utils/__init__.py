@@ -117,7 +117,7 @@ def save_image(images, image_path, save_wandb=False, down_factor=None, wandb_dow
 
     pil_image.save(image_path)
 
-    if save_wandb:
+    if save_wandb and wandb.run is not None:
         if wandb_down_factor is not None:
             # resize for speed
             pil_image = pil_image.resize((pil_image.size[0] // wandb_down_factor, pil_image.size[1] // wandb_down_factor))
@@ -177,7 +177,7 @@ def save_images(images, image_path, num_rows=None, num_cols=None, save_wandb=Fal
 
     grid_image.save(image_path)
 
-    if save_wandb:
+    if save_wandb and wandb.run is not None:
         if wandb_down_factor is not None:
             # resize for speed
             grid_image = grid_image.resize((grid_image.size[0] // wandb_down_factor, grid_image.size[1] // wandb_down_factor))

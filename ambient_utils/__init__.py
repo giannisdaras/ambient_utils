@@ -48,12 +48,18 @@ def from_noise_pred_to_x0_pred_vp(noisy_input, noise_pred, sigma):
     sigma = broadcast_batch_tensor(sigma)
     return (noisy_input - sigma * noise_pred) / torch.sqrt(1 - sigma ** 2)
 
+def from_x0_pred_to_noise_pred_vp(noisy_input, x0_pred, sigma):
+    sigma = broadcast_batch_tensor(sigma)
+    return (noisy_input - x0_pred * torch.sqrt(1 - sigma ** 2)) / sigma
+
 
 def from_x0_pred_to_xnature_pred_vp_to_vp(x0_pred, noisy_input, current_sigma, desired_sigma):
     current_sigma, desired_sigma = [broadcast_batch_tensor(x) for x in [current_sigma, desired_sigma]]
     scaling_coeff = ambient_sqrt((1 - desired_sigma**2) / (1 - current_sigma ** 2))
     noise_coeff = ambient_sqrt(desired_sigma ** 2 - (scaling_coeff ** 2) * current_sigma ** 2)
     return ((noise_coeff / desired_sigma) ** 2 * (ambient_sqrt(1 - desired_sigma ** 2) * x0_pred - noisy_input) + noisy_input) / scaling_coeff
+
+
 
 
 def add_extra_noise_from_vp_to_vp(noisy_input, current_sigma, desired_sigma):
@@ -297,4 +303,26 @@ def get_rel_methods(obj, keyword):
     """
     return [attr for attr in dir(obj) if keyword in attr]
 
+    
+
+def color_image_border(images, color_mask, border_thickness=5):
+    """
+        Colors the border of the image for which color_mask is True with the given color.
+        Args:
+            images: (batch_size, num_channels, height, width)
+            color_mask: (batch_size,)
+        Returns:
+            colored_images: (batch_size, num_channels, height, width)
+    """
+    assert images.shape[0] == color_mask.shape[0]
+    height = images.shape[2]
+    width = images.shape[3]
+    colored_images = images.clone()
+    
+    expanded_color_mask = 1 - color_mask[:, None, None, None].to(images.device)
+    colored_images[:, 0, :border_thickness, :] = expanded_color_mask[:, 0, :border_thickness, :] * colored_images[:, 0, :border_thickness, :] + (1 - expanded_color_mask[:, 0, :border_thickness, :]) * 1
+    colored_images[:, 0, height - border_thickness - 1:, :] = expanded_color_mask[:, 0] * colored_images[:, 0, height - border_thickness - 1:, :] + (1 - expanded_color_mask[:, 0]) * 1
+    colored_images[:, 0, :, :border_thickness] = expanded_color_mask[:, 0, :, :border_thickness] * colored_images[:, 0, :, :border_thickness] + (1 - expanded_color_mask[:, 0, :, :border_thickness]) * 1
+    colored_images[:, 0, :, width - border_thickness - 1:] = expanded_color_mask[:, 0] * colored_images[:, 0, :, width - border_thickness - 1:] + (1 - expanded_color_mask[:, 0]) * 1
+    return colored_images
     

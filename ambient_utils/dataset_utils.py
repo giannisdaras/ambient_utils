@@ -142,12 +142,13 @@ class Dataset(torch.utils.data.Dataset):
             # image = image.astype(np.float32) / 127.5 - 1
             image = image.astype(np.float32) / 255.0
         
-        if self.noise_type == "ve":
-            image += self.sigma * np.random.normal(size=image.shape)
-        elif self.noise_type == "vp":
-            image = np.sqrt(1 - self.sigma**2) * image + self.sigma * np.random.normal(size=image.shape)
-        else:
-            raise NotImplementedError(f"Noise type {self.noise_type} not implemented.")
+        if self.sigma > 0:
+            if self.noise_type == "ve":
+                image += self.sigma * np.random.normal(size=image.shape)
+            elif self.noise_type == "vp":
+                image = np.sqrt(1 - self.sigma**2) * image + self.sigma * np.random.normal(size=image.shape)
+            else:
+                raise NotImplementedError(f"Noise type {self.noise_type} not implemented.")
 
         if self.corruption_pattern == "dust":                
             if self.mask_full_rgb:

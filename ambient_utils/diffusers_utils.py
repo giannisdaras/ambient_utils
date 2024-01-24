@@ -1,6 +1,7 @@
 import torch
 from datasets import Dataset
 from torchvision import transforms
+import PIL
 
 def timesteps_to_sigma(timesteps, alphas_cumprod):
     sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
@@ -98,7 +99,8 @@ def hot_sample(pipe, noisy_latent, steps, captions=None, normal_sampling_steps=5
     return sampled_images
 
 
-def run_unet(pipe, noisy_latent, steps, resolution=None, captions=None):
+
+def run_unet(pipe, noisy_latent, steps, resolution=None, captions=None, return_noise=False):
     if resolution is None:
         resolution = noisy_latent.shape[-2]
     if captions is None:
@@ -114,7 +116,8 @@ def run_unet(pipe, noisy_latent, steps, resolution=None, captions=None):
     unet_added_conditions = {"time_ids": add_time_ids.cuda(), "text_embeds": pooled_prompt_embeds.cuda()}
 
     noise_pred = pipe.unet(noisy_latent, steps, prompt_embeds, added_cond_kwargs=unet_added_conditions).sample
-
+    if return_noise:
+        return noise_pred
     alphas_cumprod = pipe.scheduler.alphas_cumprod[steps.cpu()].cuda()[:, None, None, None]
     denoised_latent = (1 / torch.sqrt(alphas_cumprod) ) * (noisy_latent + (1 - alphas_cumprod) * noise_pred)
     return denoised_latent

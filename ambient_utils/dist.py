@@ -53,3 +53,10 @@ def print0(*args, **kwargs):
         print(*args, **kwargs)
 
 #----------------------------------------------------------------------------
+
+
+def get_rank_batches(num_images, max_batch_size):
+    num_batches = ((num_images - 1) // (max_batch_size * get_world_size()) + 1) * get_world_size()
+    all_batches = torch.arange(num_images).tensor_split(num_batches)
+    rank_batches = all_batches[get_rank() :: get_world_size()]
+    return rank_batches

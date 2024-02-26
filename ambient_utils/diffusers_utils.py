@@ -9,6 +9,7 @@ from diffusers.training_utils import EMAModel
 from diffusers import UNet2DConditionModel
 from diffusers import AutoencoderKL
 from diffusers import StableDiffusionXLPipeline
+from diffusers import EulerDiscreteScheduler
 import numpy as np
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
@@ -177,10 +178,11 @@ def from_noise_pred_to_x0_pred_vp(noisy_input, noise_pred, sigma):
 
 
 def run_unet(pipe, noisy_latent, steps, resolution=None, captions=None, return_noise=False):
-    # see pipe.scheduler.scale_model_input
-    divisor = np.array(((1 - pipe.scheduler.alphas_cumprod) / pipe.scheduler.alphas_cumprod) ** 0.5)[steps.cpu()]
-    divisor = broadcast_batch_tensor(torch.tensor(divisor, device=noisy_latent.device))
-    noisy_latent /= ((divisor **2 + 1) ** 0.5)
+    if isinstance(pipe.scheduler, EulerDiscreteScheduler):
+        # see pipe.scheduler.scale_model_input
+        divisor = np.array(((1 - pipe.scheduler.alphas_cumprod) / pipe.scheduler.alphas_cumprod) ** 0.5)[steps.cpu()]
+        divisor = broadcast_batch_tensor(torch.tensor(divisor, device=noisy_latent.device))
+        noisy_latent /= ((divisor **2 + 1) ** 0.5)
 
     if resolution is None:
         resolution = noisy_latent.shape[-2]

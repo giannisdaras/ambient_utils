@@ -362,10 +362,18 @@ class EasyDict(dict):
         del self[name]
 
 def expand_vars(args):
-    args = EasyDict(vars(args))
+    if not isinstance(args, dict):
+        args = EasyDict(vars(args))
+    else:
+        args = EasyDict(args)
     for key, value in args.items():
         if isinstance(value, str) and "$" in value:
             args[key] = os.path.expandvars(value)
     return args  
 
+def set_seed(seed=42):
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 

@@ -377,3 +377,34 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def is_file(filename):
+    if not filename.startswith('s3://'):
+        return os.path.isfile(filename)
+    else:
+        s3 = s3fs.S3FileSystem(anon=False)
+        return s3.isfile(filename)
+
+
+def pad_image(image, mode='reflect', height_patch=14, width_patch=14):
+    # Get the input image shape
+    batch, channels, height, width = image.shape
+    
+    # Calculate the padding required for height and width
+    padding_height = (height_patch - (height % height_patch)) % height_patch
+    padding_width = (width_patch - (width % width_patch)) % width_patch
+    
+    # Determine the padding on each side
+    top_padding = padding_height // 2
+    bottom_padding = padding_height - top_padding
+    left_padding = padding_width // 2
+    right_padding = padding_width - left_padding
+    
+    # Apply the padding to the image tensor
+    padding = (left_padding, right_padding, top_padding, bottom_padding)
+    padded_image = torch.nn.functional.pad(image, padding, mode=mode)
+
+    return padded_image
+
+
+

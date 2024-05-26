@@ -63,14 +63,16 @@ class Dataset(torch.utils.data.Dataset):
         xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
         random_seed = 0,        # Random seed to use when applying max_size.
         cache       = False,    # Cache images in CPU memory?
-        corruption_probability = 0.,   # Probability to corrupt a single image.
-        delta_probability = 0.,  # Probability to corrupt further an already corrupted image.
+        corruption_probability_per_image = 1.,  # Probability to corrupt an image.
+        corruption_probability_per_pixel = 0.,   # Probability to corrupt a single pixel.
+        delta_probability_per_pixel = 0.,  # Probability to corrupt further an already corrupted pixel.
         mask_full_rgb = False,
         corruption_pattern = "dust",
         ratios = [1.0, 0.8, 0.6, 0.4, 0.2, 0.1],  # potential downsampling ratios,
         normalize=True,
         sigma=0.0,
         noise_type="ve",
+        only_positive=True,  # whether to return images in [0, 1] or [-1, 1]
     ):
         assert corruption_pattern in ["dust", "box", "fixed_box", "keep_patch"], \
             "corruption_pattern must be either 'dust', 'box', 'keep_patch', or 'fixed_box'"
@@ -82,14 +84,16 @@ class Dataset(torch.utils.data.Dataset):
         self._cached_images = dict() # {raw_idx: np.ndarray, ...}
         self._raw_labels = None
         self._label_shape = None
-        self.corruption_probability = corruption_probability
-        self.delta_probability = delta_probability
+        self.corruption_probability_per_image = corruption_probability_per_image
+        self.corruption_probability_per_pixel = corruption_probability_per_pixel
+        self.delta_probability_per_pixel = delta_probability_per_pixel
         self.mask_full_rgb = mask_full_rgb
         self.corruption_pattern = corruption_pattern
         self.ratios = ratios
         self.normalize = normalize
         self.sigma = sigma
         self.noise_type = noise_type
+        self.only_positive = only_positive
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
@@ -151,37 +155,52 @@ class Dataset(torch.utils.data.Dataset):
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
         
-        # get array that masks each pixel with probability self.corruption_probability with fixed seed for reproducibility
+        # get array that masks each pixel with probability self.corruption_probability_per_pixel with fixed seed for reproducibility
         np.random.seed(raw_idx)
         torch.manual_seed(raw_idx)
         if self.normalize:
-            # image = image.astype(np.float32) / 127.5 - 1
-            image = image.astype(np.float32) / 255.0
-        
-        if self.sigma > 0:
-            if self.noise_type == "ve":
-                image += self.sigma * np.random.normal(size=image.shape)
-            elif self.noise_type == "vp":
-                image = np.sqrt(1 - self.sigma**2) * image + self.sigma * np.random.normal(size=image.shape)
+            if self.only_positive:
+                image = image.astype(np.float32) / 255.0
             else:
-                raise NotImplementedError(f"Noise type {self.noise_type} not implemented.")
+                image = image.astype(np.float32) / 127.5 - 1
 
         if self.corruption_pattern == "dust":                
             if self.mask_full_rgb:
-                corruption_mask = np.random.binomial(1, 1 - self.corruption_probability, size=image.shape[1:]).astype(np.float32)
+                corruption_mask = np.random.binomial(1, self.corruption_probability_per_pixel, size=image.shape[1:]).astype(np.float32)
                 corruption_mask = corruption_mask[np.newaxis, :, :].repeat(image.shape[0], axis=0)
-                extra_mask = np.random.binomial(1, 1 - self.delta_probability, size=image.shape[1:]).astype(np.float32)
-                extra_mask = extra_mask[np.newaxis, :, :].repeat(image.shape[0], axis=0)
             else:
-                corruption_mask = np.random.binomial(1, 1 - self.corruption_probability, size=image.shape).astype(np.float32)
+                corruption_mask = np.random.binomial(1, self.corruption_probability_per_pixel, size=image.shape).astype(np.float32)
         else:
             raise NotImplementedError("Corruption pattern not implemented")
-        
+
+        # some images will not get corrupted
+        if np.random.rand() < self.corruption_probability_per_image:
+            corruption_mask = np.zeros_like(corruption_mask)
+            noise_level = 0.0
+            noise = np.zeros_like(image)
+        else:
+            # corruption happens here
+            if self.sigma > 0:
+                if self.noise_type == "ve":
+                    noise = np.random.normal(size=image.shape)
+                    image += self.sigma * noise
+                elif self.noise_type == "vp":
+                    noise = np.random.normal(size=image.shape)
+                    image = np.sqrt(1 - self.sigma**2) * image + self.sigma * noise
+                else:
+                    raise NotImplementedError(f"Noise type {self.noise_type} not implemented.")
+            else:
+                noise = np.zeros_like(image)
+            noise_level = self.sigma
+
         return {
             "image": image.copy(),
+            "label": self.get_label(idx),
             "filename": self._image_fnames[raw_idx],
-            "corruption_mask": corruption_mask,
             "raw_idx": raw_idx,
+            "noise": noise,
+            "sigma": noise_level,
+            "corruption_mask": corruption_mask,  # is 1 if there is corruption, 0 otherwise
         }
 
     def get_by_filename(self, filename):

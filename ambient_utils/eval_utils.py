@@ -108,11 +108,9 @@ def calculate_inception_stats(
     return mu.cpu().numpy(), sigma.cpu().numpy(), inception_score
 
 
-def calculate_fid_from_inception_stats(mu, sigma, ref_path):
-    with open_url(ref_path) as f:
-        ref = dict(np.load(f))
-    mu_ref, sigma_ref = ref['mu'], ref['sigma']
-    m = np.square(mu - mu_ref).sum()
-    s, _ = scipy.linalg.sqrtm(np.dot(sigma, sigma_ref), disp=False)
-    fid = m + np.trace(sigma + sigma_ref - s * 2)
+def calculate_fid_from_inception_stats(mu, sigma, ref_mu, ref_sigma):
+    m = np.square(mu - ref_mu).sum()
+    s, _ = scipy.linalg.sqrtm(np.dot(sigma, ref_sigma), disp=False)
+    fid = m + np.trace(sigma + ref_sigma - s * 2)
     return float(np.real(fid))
+

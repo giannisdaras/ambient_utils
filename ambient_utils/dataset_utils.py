@@ -174,7 +174,7 @@ class Dataset(torch.utils.data.Dataset):
             raise NotImplementedError("Corruption pattern not implemented")
 
         # some images will not get corrupted
-        if np.random.rand() < self.corruption_probability_per_image:
+        if np.random.rand() > self.corruption_probability_per_image:
             corruption_mask = np.zeros_like(corruption_mask)
             noise_level = 0.0
             noise = np.zeros_like(image)

@@ -4,11 +4,11 @@ import numpy as np
 import scipy
 from ambient_utils import dist
 from tqdm import tqdm
-from ambient_utils.dataset_utils import ImageFolderDataset
+from ambient_utils.dataset import ImageFolderDataset
 import sys
 import os
 import pickle
-from ambient_utils.url_utils import open_url
+from ambient_utils.url import open_url
 
 
 def calculate_inception_stats(

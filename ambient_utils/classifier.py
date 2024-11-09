@@ -1,9 +1,10 @@
 import torch
+from typing import Callable
 
 def get_classifier_trajectory(
     model: torch.nn.Module,
     input: torch.Tensor,
-    scheduler: callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    scheduler: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     diffusion_times: torch.Tensor,
     device: str = 'cuda'
 ) -> torch.Tensor:

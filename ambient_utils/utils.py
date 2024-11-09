@@ -267,7 +267,7 @@ def pad_image(image, mode='reflect', height_patch=14, width_patch=14):
     return padded_image
 
 
-def batch_vmap(fn, inputs, batch_size, randomness="different"):
+def batch_vmap(fn, inputs, batch_size, randomness="same"):
     """
     Applies `fn` to `inputs` in parallel, in batches of size `batch_size` to avoid OOM issues.
 

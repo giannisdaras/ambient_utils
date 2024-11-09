@@ -7,7 +7,7 @@ def get_classifier_trajectory(
     input: torch.Tensor,
     scheduler: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     diffusion_times: torch.Tensor,
-    device: str = 'cuda'
+    device: str = 'cuda',
     batch_size: int = 1,
 ) -> torch.Tensor:
     """

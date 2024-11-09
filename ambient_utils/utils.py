@@ -267,7 +267,7 @@ def pad_image(image, mode='reflect', height_patch=14, width_patch=14):
     return padded_image
 
 
-def batch_vmap(fn, inputs, batch_size):
+def batch_vmap(fn, inputs, batch_size, randomness="different"):
     """
     Applies `fn` to `inputs` in parallel, in batches of size `batch_size` to avoid OOM issues.
 
@@ -283,7 +283,7 @@ def batch_vmap(fn, inputs, batch_size):
     for i in range(0, inputs.size(0), batch_size):
         batch_inputs = inputs[i:i + batch_size]
         # Apply `torch.vmap(fn)` over this batch
-        batch_results = torch.vmap(fn)(batch_inputs)
+        batch_results = torch.vmap(fn, randomness=randomness)(batch_inputs)
         results.append(batch_results)
     
     return torch.cat(results, dim=0)

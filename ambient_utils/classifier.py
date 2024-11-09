@@ -27,7 +27,7 @@ def get_classifier_trajectory(
     with torch.no_grad():
         for t in diffusion_times:
             input = scheduler(input, t)
-            output = model(input)
+            output = model(input, t.unsqueeze(0))
             predictions.append(output.cpu())
     return torch.stack(predictions)
 

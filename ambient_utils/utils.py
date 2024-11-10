@@ -267,23 +267,3 @@ def pad_image(image, mode='reflect', height_patch=14, width_patch=14):
     return padded_image
 
 
-def batch_vmap(fn, inputs, batch_size, randomness="same"):
-    """
-    Applies `fn` to `inputs` in parallel, in batches of size `batch_size` to avoid OOM issues.
-
-    Args:
-        fn (Callable): The function to vectorize using `torch.vmap`.
-        inputs (Tensor): The inputs to process, where each entry along the first dimension is a separate input.
-        batch_size (int): The number of inputs to process in parallel at once.
-
-    Returns:
-        Tensor: The concatenated results of applying `fn` to `inputs` in parallel in batches.
-    """
-    results = []
-    for i in range(0, inputs.size(0), batch_size):
-        batch_inputs = inputs[i:i + batch_size]
-        # Apply `torch.vmap(fn)` over this batch
-        batch_results = torch.vmap(fn, randomness=randomness)(batch_inputs)
-        results.append(batch_results)
-    
-    return torch.cat(results, dim=0)

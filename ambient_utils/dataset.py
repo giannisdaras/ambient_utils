@@ -1,12 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# This work is licensed under a Creative Commons
-# Attribution-NonCommercial-ShareAlike 4.0 International License.
-# You should have received a copy of the license along with this
-# work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
-
-"""Streaming images and labels from datasets created with dataset_tool.py."""
-
+import glob
 import os
 import numpy as np
 import zipfile
@@ -22,6 +14,7 @@ except ImportError:
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision
 import torchvision.transforms.functional as TF
 import webdataset as wds
 from torch.utils.data import default_collate
@@ -35,6 +28,17 @@ from webdataset.tariterators import (
     url_opener,
     valid_sample,
 )
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, IterableDataset, get_worker_info
+import sys
+from multiprocessing import Value
+from ambient_utils.utils import save_images, save_image
+
+from torchvision.transforms import Normalize, Compose, RandomResizedCrop, InterpolationMode, ToTensor, Resize, \
+    CenterCrop, ColorJitter, Grayscale
+
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import logging
+
 #----------------------------------------------------------------------------
 # Abstract base class for datasets.
 
@@ -58,25 +62,13 @@ class Dataset(torch.utils.data.Dataset):
     def __init__(self,
         name,                   # Name of the dataset.
         raw_shape,              # Shape of the raw image data (NCHW).
-        max_size    = None,     # Artificially limit the size of the dataset. None = no limit. Applied before xflip.
+        max_size    = None,     # Artificially limit the size of the dataset. None = no limit.
         use_labels  = False,    # Enable conditioning labels? False = label dimension is zero.
-        xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
         random_seed = 0,        # Random seed to use when applying max_size.
         cache       = False,    # Cache images in CPU memory?
-        corruption_probability_per_image = 1.,  # Probability to corrupt an image.
-        corruption_probability_per_pixel = 0.,   # Probability to corrupt a single pixel.
-        delta_probability_per_pixel = 0.,  # Probability to corrupt further an already corrupted pixel.
-        mask_full_rgb = False,
-        corruption_pattern = "dust",
-        ratios = [1.0, 0.8, 0.6, 0.4, 0.2, 0.1],  # potential downsampling ratios,
         normalize=True,
-        sigma=0.0,
-        noise_type="ve",
         only_positive=True,  # whether to return images in [0, 1] or [-1, 1]
     ):
-        assert corruption_pattern in ["dust", "box", "fixed_box", "keep_patch"], \
-            "corruption_pattern must be either 'dust', 'box', 'keep_patch', or 'fixed_box'"
-        assert noise_type in ["ve", "vp"], "noise_type must be either 've' or 'vp'"
         self._name = name
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
@@ -84,15 +76,7 @@ class Dataset(torch.utils.data.Dataset):
         self._cached_images = dict() # {raw_idx: np.ndarray, ...}
         self._raw_labels = None
         self._label_shape = None
-        self.corruption_probability_per_image = corruption_probability_per_image
-        self.corruption_probability_per_pixel = corruption_probability_per_pixel
-        self.delta_probability_per_pixel = delta_probability_per_pixel
-        self.mask_full_rgb = mask_full_rgb
-        self.corruption_pattern = corruption_pattern
-        self.ratios = ratios
         self.normalize = normalize
-        self.sigma = sigma
-        self.noise_type = noise_type
         self.only_positive = only_positive
 
         # Apply max_size.
@@ -101,11 +85,6 @@ class Dataset(torch.utils.data.Dataset):
             np.random.RandomState(random_seed % (1 << 31)).shuffle(self._raw_idx)
             self._raw_idx = np.sort(self._raw_idx[:max_size])
 
-        # Apply xflip.
-        self._xflip = np.zeros(self._raw_idx.size, dtype=np.uint8)
-        if xflip:
-            self._raw_idx = np.tile(self._raw_idx, 2)
-            self._xflip = np.concatenate([self._xflip, np.ones_like(self._xflip)])
         
     def _get_raw_labels(self):
         if self._raw_labels is None:
@@ -151,9 +130,6 @@ class Dataset(torch.utils.data.Dataset):
         assert isinstance(image, np.ndarray)
         assert list(image.shape) == self.image_shape
         assert image.dtype == np.uint8
-        if self._xflip[idx]:
-            assert image.ndim == 3 # CHW
-            image = image[:, :, ::-1]
         
         # get array that masks each pixel with probability self.corruption_probability_per_pixel with fixed seed for reproducibility
         np.random.seed(raw_idx)
@@ -164,43 +140,12 @@ class Dataset(torch.utils.data.Dataset):
             else:
                 image = image.astype(np.float32) / 127.5 - 1
 
-        if self.corruption_pattern == "dust":                
-            if self.mask_full_rgb:
-                corruption_mask = np.random.binomial(1, self.corruption_probability_per_pixel, size=image.shape[1:]).astype(np.float32)
-                corruption_mask = corruption_mask[np.newaxis, :, :].repeat(image.shape[0], axis=0)
-            else:
-                corruption_mask = np.random.binomial(1, self.corruption_probability_per_pixel, size=image.shape).astype(np.float32)
-        else:
-            raise NotImplementedError("Corruption pattern not implemented")
-
-        # some images will not get corrupted
-        if np.random.rand() > self.corruption_probability_per_image:
-            corruption_mask = np.zeros_like(corruption_mask)
-            noise_level = 0.0
-            noise = np.zeros_like(image)
-        else:
-            # corruption happens here
-            if self.sigma > 0:
-                if self.noise_type == "ve":
-                    noise = np.random.normal(size=image.shape)
-                    image += self.sigma * noise
-                elif self.noise_type == "vp":
-                    noise = np.random.normal(size=image.shape)
-                    image = np.sqrt(1 - self.sigma**2) * image + self.sigma * noise
-                else:
-                    raise NotImplementedError(f"Noise type {self.noise_type} not implemented.")
-            else:
-                noise = np.zeros_like(image)
-            noise_level = self.sigma
 
         return {
             "image": image.copy(),
             "label": self.get_label(idx),
             "filename": self._image_fnames[raw_idx],
             "raw_idx": raw_idx,
-            "noise": noise,
-            "sigma": noise_level,
-            "corruption_mask": corruption_mask,  # is 1 if there is corruption, 0 otherwise
         }
 
     def get_by_filename(self, filename):
@@ -218,8 +163,8 @@ class Dataset(torch.utils.data.Dataset):
     def get_details(self, idx):
         d = EasyDict()
         d.raw_idx = int(self._raw_idx[idx])
-        d.xflip = (int(self._xflip[idx]) != 0)
         d.raw_label = self._get_raw_labels()[d.raw_idx].copy()
+        d.filename = self._image_fnames[d.raw_idx]
         return d
 
     @property
@@ -362,6 +307,37 @@ class ImageFolderDataset(Dataset):
     
 
 
+class SyntheticallyCorruptedImageFolderDataset(ImageFolderDataset):
+    def __init__(self, corruption_probability: float = 0.5, 
+                 corruptions_dict: EasyDict = {},
+                 *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.corruption_probability = corruption_probability
+        self.corruptions_dict = corruptions_dict
+    
+    def __getitem__(self, idx):
+        item = super().__getitem__(idx)
+        image = item["image"]
+        # fix seed to idx
+        np.random.seed(idx)
+        torch.manual_seed(idx)
+
+        if np.random.random() < self.corruption_probability:
+            item["corruption_label"] = 1
+            # pick one of the corruptions
+            corruption_name = np.random.choice(list(self.corruptions_dict.keys()))
+            corruption_fn = getattr(__import__('ambient_utils.noise'), "apply_" + corruption_name)
+            # clone numpy array image to avoid in-place corruption
+            item["original_image"] = image.copy()
+            # materialize params
+            corruption_params = {key: f() for key, f in self.corruptions_dict[corruption_name].items()}
+            item["image"] = corruption_fn(item["image"], **corruption_params)
+        else:
+            item["corruption_label"] = 0
+        return item
+
+
+
 #----------------------------------------------------------------------------
 
 def filter_keys(key_set):
@@ -406,86 +382,387 @@ def tarfile_to_samples_nothrow(src, handler=wds.warn_and_continue):
     return samples
 
 
-class WebDataset:
+_SHARD_SHUFFLE_SIZE = 2000
+_SHARD_SHUFFLE_INITIAL = 500
+_SAMPLE_SHUFFLE_SIZE = 5000
+_SAMPLE_SHUFFLE_INITIAL = 1000
+
+
+class detshuffle2(wds.PipelineStage):
+    def __init__(
+            self,
+            bufsize=1000,
+            initial=100,
+            seed=0,
+            epoch=-1,
+    ):
+        self.bufsize = bufsize
+        self.initial = initial
+        self.seed = seed
+        self.epoch = epoch
+
+    def run(self, src):
+        if isinstance(self.epoch, SharedEpoch):
+            epoch = self.epoch.get_value()
+        else:
+            # NOTE: this is epoch tracking is problematic in a multiprocess (dataloader workers or train)
+            # situation as different workers may wrap at different times (or not at all).
+            self.epoch += 1
+            epoch = self.epoch
+        rng = random.Random()
+        if self.seed < 0:
+            # If seed is negative, we use the worker's seed, this will be different across all nodes/workers
+            seed = pytorch_worker_seed(epoch)
+        else:
+            # This seed to be deterministic AND the same across all nodes/workers in each epoch
+            seed = self.seed + epoch
+        rng.seed(seed)
+        return _shuffle(src, self.bufsize, self.initial, rng)
+
+def expand_urls(urls, weights=None):
+    if weights is None:
+        expanded_urls = wds.shardlists.expand_urls(urls)
+        return expanded_urls, None
+    if isinstance(urls, str):
+        urllist = urls.split("::")
+        weights = weights.split('::')
+        assert len(weights) == len(urllist),\
+            f"Expected the number of data components ({len(urllist)}) and weights({len(weights)}) to match."
+        weights = [float(weight) for weight in weights]
+        all_urls, all_weights = [], []
+        for url, weight in zip(urllist, weights):
+            expanded_url = list(braceexpand.braceexpand(url))
+            expanded_weights = [weight for _ in expanded_url]
+            all_urls.extend(expanded_url)
+            all_weights.extend(expanded_weights)
+        return all_urls, all_weights
+    else:
+        all_urls = list(urls)
+        return all_urls, weights
+
+class ResampledShards2(IterableDataset):
+    """An iterable dataset yielding a list of urls."""
+
     def __init__(
         self,
-        train_shards_path_or_url: Union[str, List[str]],
-        num_train_examples: int,
-        per_gpu_batch_size: int,
-        global_batch_size: int,
-        resolution: int,
-        num_workers: int,
-        shuffle_buffer_size: int = 1000,
-        pin_memory: bool = False,
-        persistent_workers: bool = False,
-        transform_fn: Callable = None
+        urls,
+        weights=None,
+        nshards=sys.maxsize,
+        worker_seed=None,
+        deterministic=False,
+        epoch=-1,
     ):
-        if not isinstance(train_shards_path_or_url, str):
-            train_shards_path_or_url = [list(braceexpand(urls)) for urls in train_shards_path_or_url]
-            # flatten list using itertools
-            train_shards_path_or_url = list(itertools.chain.from_iterable(train_shards_path_or_url))
+        """Sample shards from the shard list with replacement.
 
-        def get_orig_size(json):
-            return (int(json.get("original_width", 0.0)), int(json.get("original_height", 0.0)))
+        :param urls: a list of URLs as a Python list or brace notation string
+        """
+        super().__init__()
+        urls, weights = expand_urls(urls, weights)
+        self.urls = urls
+        self.weights = weights
+        if self.weights is not None:
+            assert len(self.urls) == len(self.weights),\
+                f"Number of urls {len(self.urls)} and weights {len(self.weights)} should match."
+        assert isinstance(self.urls[0], str)
+        self.nshards = nshards
+        self.rng = random.Random()
+        self.worker_seed = worker_seed
+        self.deterministic = deterministic
+        self.epoch = epoch
 
-        def to_tensor(example):
-            # resize image
-            image = example["image"]
-            image = TF.resize(image, resolution, interpolation=transforms.InterpolationMode.BILINEAR)
+    def __iter__(self):
+        """Return an iterator over the shards."""
+        if isinstance(self.epoch, SharedEpoch):
+            epoch = self.epoch.get_value()
+        else:
+            # NOTE: this is epoch tracking is problematic in a multiprocess (dataloader workers or train)
+            # situation as different workers may wrap at different times (or not at all).
+            self.epoch += 1
+            epoch = self.epoch
+        if self.deterministic:
+            # reset seed w/ epoch if deterministic
+            if self.worker_seed is None:
+                # pytorch worker seed should be deterministic due to being init by arg.seed + rank + worker id
+                seed = pytorch_worker_seed(epoch)
+            else:
+                seed = self.worker_seed() + epoch
+            self.rng.seed(seed)
+        for _ in range(self.nshards):
+            if self.weights is None:
+                yield dict(url=self.rng.choice(self.urls))
+            else:
+                yield dict(url=self.rng.choices(self.urls, weights=self.weights, k=1)[0])
 
-            # get crop coordinates and crop image
-            c_top, c_left, _, _ = transforms.RandomCrop.get_params(image, output_size=(resolution, resolution))
-            image = TF.crop(image, c_top, c_left, resolution, resolution)
-            image = TF.to_tensor(image)
-            image = TF.normalize(image, [0.5], [0.5])
-            example["image"] = image
-            example["crop_coords"] = (c_top, c_left)
-            return example
 
-        processing_pipeline = [
-            wds.decode("pil", handler=wds.ignore_and_continue),
-            wds.rename(
-                image="jpg;png;jpeg;webp", text="text;txt;caption", orig_size="json", handler=wds.warn_and_continue
+def pytorch_worker_seed(increment=0):
+    """get dataloader worker seed from pytorch"""
+    worker_info = get_worker_info()
+    if worker_info is not None:
+        # favour using the seed already created for pytorch dataloader workers if it exists
+        seed = worker_info.seed
+        if increment:
+            # space out seed increments so they can't overlap across workers in different iterations
+            seed += increment * max(1, worker_info.num_workers)
+        return seed
+    # fallback to wds rank based seed
+    return wds.utils.pytorch_worker_seed()
+
+
+class SharedEpoch:
+    def __init__(self, epoch: int = 0):
+        self.shared_epoch = Value('i', epoch)
+
+    def set_value(self, epoch):
+        self.shared_epoch.value = epoch
+
+    def get_value(self):
+        return self.shared_epoch.value
+
+def log_and_continue(exn):
+    """Call in an exception handler to ignore any exception, issue a warning, and continue."""
+    logging.warning(f'Handling webdataset error ({repr(exn)}). Ignoring.')
+    return True
+
+
+def tarfile_to_samples_nothrow(src, handler=log_and_continue):
+    # NOTE this is a re-impl of the webdataset impl with group_by_keys that doesn't throw
+    streams = url_opener(src, handler=handler)
+    files = tar_file_expander(streams, handler=handler)
+    samples = group_by_keys_nothrow(files, handler=handler)
+    return samples
+
+def filter_no_caption_or_no_image(sample):
+    has_caption = ('txt' in sample)
+    has_image = ('png' in sample or 'jpg' in sample or 'jpeg' in sample or 'webp' in sample)
+    return has_caption and has_image
+
+def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, handler=None):
+    """Return function over iterator that groups key, value pairs into samples.
+
+    :param keys: function that splits the key into key and extension (base_plus_ext)
+    :param lcase: convert suffixes to lower case (Default value = True)
+    """
+    current_sample = None
+    for filesample in data:
+        assert isinstance(filesample, dict)
+        fname, value = filesample["fname"], filesample["data"]
+        prefix, suffix = keys(fname)
+        if prefix is None:
+            continue
+        if lcase:
+            suffix = suffix.lower()
+        # FIXME webdataset version throws if suffix in current_sample, but we have a potential for
+        #  this happening in the current LAION400m dataset if a tar ends with same prefix as the next
+        #  begins, rare, but can happen since prefix aren't unique across tar files in that dataset
+        if current_sample is None or prefix != current_sample["__key__"] or suffix in current_sample:
+            if valid_sample(current_sample):
+                yield current_sample
+            current_sample = dict(__key__=prefix, __url__=filesample["__url__"])
+        if suffixes is None or suffix in suffixes:
+            current_sample[suffix] = value
+    if valid_sample(current_sample):
+        yield current_sample
+
+OPENAI_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
+OPENAI_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+INCEPTION_MEAN = (0.5, 0.5, 0.5)
+INCEPTION_STD = (0.5, 0.5, 0.5)
+
+def image_transform(
+    image_size: Union[int, Tuple[int, int]],
+    mean: Optional[Tuple[float, ...]] = None,
+    std: Optional[Tuple[float, ...]] = None,
+    resize_mode: Optional[str] = None,
+    interpolation: Optional[str] = None,
+    fill_color: int = 0,
+):
+    mean = mean or OPENAI_DATASET_MEAN
+    if not isinstance(mean, (list, tuple)):
+        mean = (mean,) * 3
+
+    std = std or OPENAI_DATASET_STD
+    if not isinstance(std, (list, tuple)):
+        std = (std,) * 3
+
+    interpolation = interpolation or 'bicubic'
+    assert interpolation in ['bicubic', 'bilinear', 'random']
+    # NOTE random is ignored for interpolation_mode, so defaults to BICUBIC for inference if set
+    interpolation_mode = InterpolationMode.BILINEAR if interpolation == 'bilinear' else InterpolationMode.BICUBIC
+
+    resize_mode = resize_mode or 'shortest'
+    assert resize_mode in ('shortest', 'longest', 'squash')
+
+    normalize = Normalize(mean=mean, std=std)
+    if resize_mode == 'longest':
+        transforms = [
+            ResizeKeepRatio(image_size, interpolation=interpolation_mode, longest=1),
+            CenterCropOrPad(image_size, fill=fill_color)
+        ]
+    elif resize_mode == 'squash':
+        if isinstance(image_size, int):
+            image_size = (image_size, image_size)
+        transforms = [
+            Resize(image_size, interpolation=interpolation_mode),
+        ]
+    else:
+        assert resize_mode == 'shortest'
+        if not isinstance(image_size, (tuple, list)):
+            image_size = (image_size, image_size)
+        if image_size[0] == image_size[1]:
+            # simple case, use torchvision built-in Resize w/ shortest edge mode (scalar size arg)
+            transforms = [
+                Resize(image_size[0], interpolation=interpolation_mode)
+            ]
+        else:
+            # resize shortest edge to matching target dim for non-square target
+            transforms = [ResizeKeepRatio(image_size)]
+        transforms += [CenterCrop(image_size)]
+
+    transforms.extend([
+        lambda image: image.convert("RGB"),
+        ToTensor(),
+        # normalize,
+    ])
+    return Compose(transforms)
+
+def get_wds_dataset(input_shards, batch_size, is_train=False, 
+                    epoch=0, floor=False, num_samples=10000, seed=42, 
+                    workers=1, world_size=1):
+    resampled = is_train
+
+    num_shards = None
+    shared_epoch = SharedEpoch(epoch=epoch)  # create a shared epoch store to sync epoch to dataloader worker proc
+   
+    if resampled:
+        pipeline = [ResampledShards2(
+            input_shards,
+            weights=None,
+            deterministic=True,
+            epoch=shared_epoch,
+        )]
+    else:
+        pipeline = [wds.SimpleShardList(input_shards)]
+
+    # at this point we have an iterator over all the shards
+    if is_train:
+        if not resampled:
+            pipeline.extend([
+                detshuffle2(
+                    bufsize=_SHARD_SHUFFLE_SIZE,
+                    initial=_SHARD_SHUFFLE_INITIAL,
+                    seed=seed,
+                    epoch=shared_epoch,
+                ),
+                wds.split_by_node,
+                wds.split_by_worker,
+            ])
+        pipeline.extend([
+            # at this point, we have an iterator over the shards assigned to each worker at each node
+            tarfile_to_samples_nothrow,  # wds.tarfile_to_samples(handler=log_and_continue),
+            wds.shuffle(
+                bufsize=_SAMPLE_SHUFFLE_SIZE,
+                initial=_SAMPLE_SHUFFLE_INITIAL,
             ),
-            wds.map(filter_keys({"image", "text", "orig_size"})),
-            wds.map_dict(orig_size=get_orig_size),
-            wds.map(to_tensor)
-        ]
-        if transform_fn is not None:
-            processing_pipeline.append(wds.map(transform_fn))
-        
+        ])
+    else:
+        pipeline.extend([
+            wds.split_by_worker,
+            # at this point, we have an iterator over the shards assigned to each worker
+            wds.tarfile_to_samples(handler=log_and_continue),
+        ])
 
-        # Create train dataset and loader
-        pipeline = [
-            wds.ResampledShards(train_shards_path_or_url),
-            tarfile_to_samples_nothrow,
-            wds.shuffle(shuffle_buffer_size),
-            *processing_pipeline,
-            wds.batched(per_gpu_batch_size, partial=False, collation_fn=default_collate),
-        ]
+    def get_original_dims(sample):
+        sample["original_dims"] = sample["image"].size
+        return sample    
 
-        num_worker_batches = math.ceil(num_train_examples / (global_batch_size * num_workers))  # per dataloader worker
+    pipeline.extend([
+        wds.select(filter_no_caption_or_no_image),
+        wds.decode("pilrgb", handler=log_and_continue),
+        wds.rename(image="jpg;png;jpeg;webp", text="txt"),
+        wds.map(get_original_dims),
+        wds.map_dict(image=image_transform(image_size=224), text=lambda text: text),
+        wds.to_tuple("image", "text", "original_dims"),
+        wds.batched(batch_size, partial=not is_train)
+    ])
+
+    dataset = wds.DataPipeline(*pipeline)
+
+    if is_train:
+        if not resampled:
+            num_shards = num_shards or len(expand_urls(input_shards)[0])
+            assert num_shards >= workers * world_size, 'number of shards must be >= total workers'
+        # roll over and repeat a few samples to get same number of full batches on each node
+        round_fn = math.floor if floor else math.ceil
+        global_batch_size = batch_size * world_size
+        num_batches = round_fn(num_samples / global_batch_size)
+        num_workers = max(1, workers)
+        num_worker_batches = round_fn(num_batches / num_workers)  # per dataloader worker
         num_batches = num_worker_batches * num_workers
         num_samples = num_batches * global_batch_size
+        dataset = dataset.with_epoch(num_worker_batches)  # each worker is iterating over this
+    else:
+        # last batches are partial, eval is done on single (master) node
+        num_batches = math.ceil(num_samples / batch_size)
 
-        # each worker is iterating over this
-        self._train_dataset = wds.DataPipeline(*pipeline).with_epoch(num_worker_batches)
-        self._train_dataloader = wds.WebLoader(
-            self._train_dataset,
-            batch_size=None,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-        )
-        # add meta-data to dataloader instance for convenience
-        self._train_dataloader.num_batches = num_batches
-        self._train_dataloader.num_samples = num_samples
+    dataloader = wds.WebLoader(
+        dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=workers,
+        persistent_workers=workers > 0,
+    )
 
-    @property
-    def train_dataset(self):
-        return self._train_dataset
+    # add meta-data to dataloader instance for convenience
+    dataloader.num_batches = num_batches
+    dataloader.num_samples = num_samples
+    return dataloader
 
-    @property
-    def train_dataloader(self):
-        return self._train_dataloader
+
+def concat_shards_in_path(shards_path):
+    shards = glob.glob(os.path.join(shards_path, "*.tar"))
+    shards = [os.path.join(shards_path, shard) for shard in shards]
+    return "::".join(shards)
+
+if __name__ == "__main__":
+    # demonstration of how to use the webdataset dataloader
+    shards = concat_shards_in_path(os.environ.get("DATACOMP_SMALL", "./"))
+    dataloader = get_wds_dataset(shards, batch_size=128, is_train=True, epoch=0, 
+                                 floor=False, num_samples=10000, seed=42, 
+                                 # hardware params
+                                 workers=1, world_size=1)
+    image, text, original_dims = next(iter(dataloader))
+    save_images(image * 2 - 1, "test_webdataset.png")
+
+    # demonstration of how to use the synthetically corrupted image folder dataset
+
+    corruptions_dict = {
+        "blur": {
+            "sigma": lambda: np.random.uniform(0.5, 8.0)
+        },
+        "mask": {
+            "masking_probability": lambda: np.random.uniform(0.05, 0.9)
+        },
+        "pixelate": {
+            "pixel_size": lambda: np.random.randint(10, 200)
+        },
+        "saturation": {
+                # Start of Selection
+                "saturation_level": lambda: np.random.uniform(0.8, 0.9) if np.random.rand() < 0.5 else np.random.uniform(1.1, 1.2)
+        },
+        "color_shift": {
+            "shift": lambda: np.random.uniform(-0.1, -0.05, size=3) if np.random.rand() < 0.5 else np.random.uniform(0.05, 0.1, size=3)
+        },
+        "imagecorruptions": {
+            "severity": lambda: np.random.randint(1, 5),
+            # "corruption_name": lambda: np.random.choice(["jpeg_compression"])
+            "corruption_name": lambda: np.random.choice(["gaussian_noise", "shot_noise", "impulse_noise", "defocus_blur", "motion_blur", "zoom_blur", "snow", "frost", "brightness", "contrast", "elastic_transform", "jpeg_compression"])
+        }
+    }
+    # TODO(@giannisdaras): de-anonymize this path
+    dataset = SyntheticallyCorruptedImageFolderDataset(path="/scratch/07362/gdaras/datasets/ffhq-256x256_train_split", 
+                                                        corruption_probability=1.0, 
+                                                        corruptions_dict=corruptions_dict)
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
+    save_images(next(iter(dataloader))["image"] * 2 - 1, "test_synthetically_corrupted.png")

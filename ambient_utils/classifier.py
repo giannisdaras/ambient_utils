@@ -1,22 +1,22 @@
 import torch
 from typing import Callable
-from ambient_utils.utils import batch_vmap
 
 def get_classifier_trajectory(
-    model: torch.nn.Module,
     input: torch.Tensor,
+    model: torch.nn.Module,
     scheduler: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     diffusion_times: torch.Tensor,
     device: str = 'cuda',
     batch_size: int = 1,
     model_output_type: str = 'logits',
+    **model_kwargs,
 ) -> torch.Tensor:
     """
     Get the trajectory of the classifier for a given input and diffusion times.
     
     Args:
-        model: The classifier model
         input: Input tensor to classify
+        model: The classifier model
         scheduler: Function that takes two tensor arguments and returns a tensor
         diffusion_times: Tensor of diffusion timesteps
         device: Device to run model on
@@ -25,20 +25,26 @@ def get_classifier_trajectory(
     Returns:
         torch.Tensor: Model output predictions
     """
-    model.to(device)
-    model.eval()
+    # model.eval()
     predictions = []
 
     def process_t(t):
-        updated_input = scheduler(input, t)
-        output = model(updated_input, t.unsqueeze(0))
-        if model_output_type == 'logits':
-            probs = torch.softmax(output, dim=1)[:, 0]
-        elif model_output_type == 'probs':
-            probs = output
+        updated_input = scheduler(input, t) if scheduler is not None else input
+        output = model(updated_input, t.unsqueeze(0).repeat(updated_input.shape[0]), **model_kwargs).squeeze()
+        if len(output.shape) == 1:
+            if model_output_type == 'logits':
+                # compute sigmoid of output
+                probs = torch.sigmoid(output)
+            else:
+                probs = output
+        else:
+            if model_output_type == 'logits':
+                probs = torch.softmax(output, dim=1)[:, 0]
+            else:
+                probs = output
         return probs.cpu()
 
-    vmapped_fn = torch.func.vmap(process_t, randomness="same", chunk_size=batch_size)
+    vmapped_fn = torch.func.vmap(process_t, randomness="different", chunk_size=batch_size)
     with torch.no_grad():
         predictions = vmapped_fn(diffusion_times)
     return predictions

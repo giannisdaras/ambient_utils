@@ -267,3 +267,24 @@ def pad_image(image, mode='reflect', height_patch=14, width_patch=14):
     return padded_image
 
 
+def ensure_tensor(func):
+    def wrapper(*args, **kwargs):
+        first_arg = args[0]
+        if isinstance(first_arg, np.ndarray):
+            args = (torch.tensor(first_arg),) + args[1:]
+        func_result = func(*args, **kwargs)
+        if isinstance(first_arg, np.ndarray):
+            return func_result.cpu().numpy()
+        return func_result
+    return wrapper
+
+def ensure_dimensions(func):
+    def wrapper(*args, **kwargs):
+        first_arg = args[0]
+        if first_arg.ndim == 3:
+            args = (first_arg.unsqueeze(0),) + args[1:]
+        func_result = func(*args, **kwargs)
+        if first_arg.ndim == 3 and func_result.ndim == 4:
+            return func_result.squeeze(0)
+        return func_result
+    return wrapper

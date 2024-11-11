@@ -1,5 +1,5 @@
 import torch
-from ambient_utils.utils import broadcast_batch_tensor, ambient_sqrt, load_image, image_to_numpy, image_from_numpy
+from ambient_utils.utils import broadcast_batch_tensor, ambient_sqrt, load_image, image_to_numpy, image_from_numpy, ensure_tensor, ensure_dimensions
 from scipy.ndimage import gaussian_filter
 import PIL
 import tempfile
@@ -110,17 +110,21 @@ def get_box_mask_that_fits(image_shape, survival_probability, device='cuda'):
     return 1 - mask
 
 
+@ensure_tensor
+@ensure_dimensions
 def apply_blur(image, sigma):
     device = image.device
     return torch.tensor(gaussian_filter(image[0].cpu(), sigma=(0, sigma, sigma))).to(device).unsqueeze(0)
 
-
+@ensure_tensor
+@ensure_dimensions
 def apply_mask(image, masking_probability):
     device = image.device
     mask = (torch.rand(image.shape[2:]) > masking_probability).unsqueeze(0).repeat(image.shape[1], 1, 1)
     return image * mask.unsqueeze(0).to(device)
 
-
+@ensure_tensor
+@ensure_dimensions
 def apply_jpeg_compression(image, quality):
     device = image.device
     image = image.cpu()
@@ -130,6 +134,9 @@ def apply_jpeg_compression(image, quality):
         image = load_image(temp_file.name, device=device) * 2 - 1
     return image
     
+
+@ensure_tensor
+@ensure_dimensions
 def apply_motion_blur(image, kernel_size, angle):
     device = image.device
     image = image.cpu()
@@ -137,6 +144,9 @@ def apply_motion_blur(image, kernel_size, angle):
     image = image.filter(PIL.ImageFilter.GaussianBlur(radius=kernel_size))
     return image_from_numpy(np.array(image)).to(device)
 
+
+@ensure_tensor
+@ensure_dimensions
 def apply_pixelate(image, pixel_size):
     device = image.device
     image = image.cpu()
@@ -146,6 +156,9 @@ def apply_pixelate(image, pixel_size):
     image = image.resize((original_size[0], original_size[1]), PIL.Image.Resampling.NEAREST)
     return image_from_numpy(np.array(image)).to(device)
 
+
+@ensure_tensor
+@ensure_dimensions
 def apply_saturation(image, saturation_level):
     device = image.device
     image = image.cpu()
@@ -153,6 +166,8 @@ def apply_saturation(image, saturation_level):
     image = np.clip(image * saturation_level, 0, 255)
     return image_from_numpy(image).to(device)
 
+@ensure_tensor
+@ensure_dimensions
 def apply_color_shift(image, shift):
     device = image.device
     image = image.cpu()
@@ -160,6 +175,8 @@ def apply_color_shift(image, shift):
     image = np.clip(image + shift, 0, 255)
     return image_from_numpy(image).to(device)
 
+@ensure_tensor
+@ensure_dimensions
 def apply_imagecorruptions(image, corruption_name, severity):
     # names: ['gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur', 'glass_blur', 'motion_blur', 'zoom_blur', 'snow', 'frost', 'fog', 'brightness', 'contrast', 'elastic_transform', 'pixelate', 'jpeg_compression']
     device = image.device
@@ -167,3 +184,5 @@ def apply_imagecorruptions(image, corruption_name, severity):
     image = image_to_numpy(image[0])
     image = np.clip(imagecorruptions.corrupt(image, corruption_name=corruption_name, severity=severity), 0, 255)
     return image_from_numpy(image).to(device)
+
+

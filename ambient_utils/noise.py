@@ -118,6 +118,12 @@ def apply_blur(image, sigma):
 
 @ensure_tensor
 @ensure_dimensions
+def apply_additive_noise(image, noise_level):
+    noise = torch.randn_like(image) * noise_level
+    return image + noise
+
+@ensure_tensor
+@ensure_dimensions
 def apply_mask(image, masking_probability):
     device = image.device
     mask = (torch.rand(image.shape[2:]) > masking_probability).unsqueeze(0).repeat(image.shape[1], 1, 1)

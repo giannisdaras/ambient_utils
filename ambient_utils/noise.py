@@ -118,8 +118,8 @@ def apply_blur(image, sigma):
 
 @ensure_tensor
 @ensure_dimensions
-def apply_additive_noise(image, noise_level):
-    noise = torch.randn_like(image) * noise_level
+def apply_additive_noise(image, sigma):
+    noise = torch.randn_like(image) * sigma
     return image + noise
 
 @ensure_tensor

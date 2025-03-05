@@ -38,6 +38,9 @@ from torchvision.transforms import Normalize, Compose, RandomResizedCrop, Interp
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import logging
+import open_clip
+
+
 
 #----------------------------------------------------------------------------
 # Abstract base class for datasets.
@@ -68,10 +71,12 @@ class Dataset(torch.utils.data.Dataset):
         cache       = False,    # Cache images in CPU memory?
         normalize=True,
         only_positive=True,  # whether to return images in [0, 1] or [-1, 1]
+        use_other_keys = False, # Load additional keys from dataset.json?
     ):
         self._name = name
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
+        self._use_other_keys = use_other_keys
         self._cache = cache
         self._cached_images = dict() # {raw_idx: np.ndarray, ...}
         self._raw_labels = None
@@ -98,6 +103,7 @@ class Dataset(torch.utils.data.Dataset):
                 assert self._raw_labels.ndim == 1
                 assert np.all(self._raw_labels >= 0)
         return self._raw_labels
+    
 
     def close(self): # to be overridden by subclass
         pass
@@ -105,8 +111,31 @@ class Dataset(torch.utils.data.Dataset):
     def _load_raw_image(self, raw_idx): # to be overridden by subclass
         raise NotImplementedError
 
-    def _load_raw_labels(self): # to be overridden by subclass
-        raise NotImplementedError
+    def _load_raw_labels(self):
+        fname = 'dataset.json'
+        if fname not in self._all_fnames:
+            return None
+        with self._open_file(fname) as f:
+            data = json.load(f)
+            labels = data.get('labels')
+            if labels is None:
+                return None
+            labels = dict(labels)
+            labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
+            labels = np.array(labels)
+            labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+        return labels
+
+    def load_additional_keys(self):
+        """Load additional keys from dataset.json if they exist."""
+        fname = 'dataset.json'
+        if fname not in self._all_fnames:
+            return None
+        with self._open_file(fname) as f:
+            data = json.load(f)
+            # Exclude 'labels' key and load other keys
+            self._other_keys_data = {key: data[key] for key in data if key != 'labels'}
+        return self._other_keys_data
 
     def __getstate__(self):
         return dict(self.__dict__, _raw_labels=None)
@@ -129,7 +158,7 @@ class Dataset(torch.utils.data.Dataset):
                 self._cached_images[raw_idx] = image
         assert isinstance(image, np.ndarray)
         assert list(image.shape) == self.image_shape
-        assert image.dtype == np.uint8
+        # assert image.dtype == np.uint8  # removed to support latent diffusion models
         
         # get array that masks each pixel with probability self.corruption_probability_per_pixel with fixed seed for reproducibility
         np.random.seed(raw_idx)
@@ -140,12 +169,13 @@ class Dataset(torch.utils.data.Dataset):
             else:
                 image = image.astype(np.float32) / 127.5 - 1
 
-
         return {
             "image": image.copy(),
             "label": self.get_label(idx),
+            # this fixes a noise realization per image in the dataset. It is useful for ambient training, but can be ignored otherwise.
+            "noise": np.random.randn(*image.shape),
             "filename": self._image_fnames[raw_idx],
-            "raw_idx": raw_idx,
+            **self.get_other_keys(raw_idx),
         }
 
     def get_by_filename(self, filename):
@@ -159,6 +189,12 @@ class Dataset(torch.utils.data.Dataset):
             onehot[label] = 1
             label = onehot
         return label.copy()
+    
+    def get_other_keys(self, idx):
+        if self._use_other_keys:
+            return {key: self.other_keys_data[key][self._raw_idx[idx]] for key in self.other_keys_data}
+        else:
+            return {}
 
     def get_details(self, idx):
         d = EasyDict()
@@ -242,7 +278,7 @@ class ImageFolderDataset(Dataset):
             self._all_fnames = {fname for fname in self._all_fnames if must_not_contain not in fname}
 
         PIL.Image.init()
-        self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in PIL.Image.EXTENSION)
+        self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in (PIL.Image.EXTENSION.keys() | {'.npy'}))
         if len(self._image_fnames) == 0:
             raise IOError('No image files found in the specified path')
 
@@ -251,6 +287,9 @@ class ImageFolderDataset(Dataset):
         if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
             raise IOError('Image files do not match the specified resolution')
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
+
+        if self._use_other_keys:
+            self.load_additional_keys()
 
     @staticmethod
     def _file_ext(fname):
@@ -282,13 +321,16 @@ class ImageFolderDataset(Dataset):
     def _load_raw_image(self, raw_idx):
         fname = self._image_fnames[raw_idx]
         with self._open_file(fname) as f:
-            if self._use_pyspng and pyspng is not None and self._file_ext(fname) == '.png':
+            if self._file_ext(fname) == '.npy':
+                image = np.load(f)
+            elif self._use_pyspng and pyspng is not None and self._file_ext(fname) == '.png':
                 image = pyspng.load(f.read())
             else:
                 image = np.array(PIL.Image.open(f))
         if image.ndim == 2:
             image = image[:, :, np.newaxis] # HW => HWC
-        image = image.transpose(2, 0, 1) # HWC => CHW
+        if self._file_ext(fname) != '.npy':
+            image = image.transpose(2, 0, 1) # HWC => CHW
         return image
 
     def _load_raw_labels(self):
@@ -296,15 +338,33 @@ class ImageFolderDataset(Dataset):
         if fname not in self._all_fnames:
             return None
         with self._open_file(fname) as f:
-            labels = json.load(f)['labels']
-        if labels is None:
-            return None
-        labels = dict(labels)
-        labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
-        labels = np.array(labels)
-        labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+            data = json.load(f)
+            labels = data.get('labels')
+            if labels is None:
+                return None
+            labels = dict(labels)
+            labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
+            labels = np.array(labels)
+            labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
         return labels
-    
+
+    def load_additional_keys(self):
+        """Load additional keys from dataset.json if they exist."""
+        fname = 'dataset.json'
+        if fname not in self._all_fnames:
+            return None
+        with self._open_file(fname) as f:
+            data = json.load(f)
+            # Exclude 'labels' key and load other keys
+            self._other_keys_data = {key: data[key] for key in data if key != 'labels'}
+        return self._other_keys_data
+
+    @property
+    def other_keys_data(self):
+        """Return additional keys data if use_other_keys is set."""
+        if self._use_other_keys:
+            return getattr(self, '_other_keys_data', None)
+        return None
 
 
 class SyntheticallyCorruptedImageFolderDataset(ImageFolderDataset):
@@ -318,6 +378,8 @@ class SyntheticallyCorruptedImageFolderDataset(ImageFolderDataset):
     def __getitem__(self, idx):
         item = super().__getitem__(idx)
         image = item["image"]
+        item["original_image"] = image.copy()
+        
         # fix seed to idx
         np.random.seed(idx)
         torch.manual_seed(idx)
@@ -328,7 +390,6 @@ class SyntheticallyCorruptedImageFolderDataset(ImageFolderDataset):
             corruption_name = np.random.choice(list(self.corruptions_dict.keys()))
             corruption_fn = getattr(__import__('ambient_utils.noise'), "apply_" + corruption_name)
             # clone numpy array image to avoid in-place corruption
-            item["original_image"] = image.copy()
             # materialize params
             corruption_params = {key: f() for key, f in self.corruptions_dict[corruption_name].items()}
             item["image"] = corruption_fn(item["image"], **corruption_params)
@@ -629,6 +690,7 @@ def image_transform(
 
 def get_wds_dataset(input_shards, batch_size, is_train=False, 
                     epoch=0, floor=False, num_samples=10000, seed=42, 
+                    annotate_fn=None, annotation_keys=[],
                     workers=1, world_size=1):
     resampled = is_train
 
@@ -683,7 +745,8 @@ def get_wds_dataset(input_shards, batch_size, is_train=False,
         wds.rename(image="jpg;png;jpeg;webp", text="txt"),
         wds.map(get_original_dims),
         wds.map_dict(image=image_transform(image_size=224), text=lambda text: text),
-        wds.to_tuple("image", "text", "original_dims"),
+        wds.map(annotate_fn if annotate_fn else lambda x: x),
+        wds.to_tuple("image", "text", "original_dims", *annotation_keys),
         wds.batched(batch_size, partial=not is_train)
     ])
 
@@ -720,49 +783,107 @@ def get_wds_dataset(input_shards, batch_size, is_train=False,
     return dataloader
 
 
+def clip_annotate_wds(label_texts=None):
+    clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
+    clip_model.eval()
+    tokenizer = open_clip.get_tokenizer('ViT-B-32')
+
+    text_features = None
+
+    if label_texts is not None:
+        tokenized_labels = tokenizer(label_texts)
+        with torch.no_grad():
+            text_features = clip_model.encode_text(tokenized_labels)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+
+
+    def annotate_fn(sample, text_features=None):
+        image = sample["image"]
+
+        if text_features is None:
+            tokenized_labels = tokenizer(sample["text"])
+            with torch.no_grad():
+                text_features = clip_model.encode_text(tokenized_labels)
+                text_features /= text_features.norm(dim=-1, keepdim=True)
+
+        with torch.no_grad():
+            image_features = clip_model.encode_image(image.unsqueeze(0))
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            inner_products = (image_features @ text_features.T)
+            clip_text_probs = (100.0 * inner_products).softmax(dim=-1)[:, 0]
+        sample["clip_text_probs"] = clip_text_probs
+        sample["inner_products"] = inner_products
+        return sample
+
+    return lambda x: annotate_fn(x, text_features)
+
+
+
+
 def concat_shards_in_path(shards_path):
     shards = glob.glob(os.path.join(shards_path, "*.tar"))
     shards = [os.path.join(shards_path, shard) for shard in shards]
     return "::".join(shards)
 
 if __name__ == "__main__":
+
+    BATCH_SIZE = 256
+    NUM_SAMPLES = 10000
+    SEED = 42
+    WORKERS = 256
+    K = 5
+    BEST = True
+
     # demonstration of how to use the webdataset dataloader
     shards = concat_shards_in_path(os.environ.get("DATACOMP_SMALL", "./"))
-    dataloader = get_wds_dataset(shards, batch_size=128, is_train=True, epoch=0, 
-                                 floor=False, num_samples=10000, seed=42, 
+    # annotate_fn = clip_annotate_wds(["low-quality image", "high-quality image"])
+    annotate_fn = clip_annotate_wds()
+
+    dataloader = get_wds_dataset(shards, batch_size=BATCH_SIZE, is_train=True, epoch=0, 
+                                 floor=False, num_samples=NUM_SAMPLES, seed=SEED,
+                                 # annotation params
+                                 annotate_fn=annotate_fn, annotation_keys=["clip_text_probs", "inner_products"],
                                  # hardware params
-                                 workers=1, world_size=1)
-    image, text, original_dims = next(iter(dataloader))
+                                 workers=WORKERS, world_size=1)
+    image, text, original_dims, text_probs, inner_products = next(iter(dataloader))
     save_images(image * 2 - 1, "test_webdataset.png")
 
-    # demonstration of how to use the synthetically corrupted image folder dataset
 
-    corruptions_dict = {
-        "blur": {
-            "sigma": lambda: np.random.uniform(0.5, 8.0)
-        },
-        "mask": {
-            "masking_probability": lambda: np.random.uniform(0.05, 0.9)
-        },
-        "pixelate": {
-            "pixel_size": lambda: np.random.randint(10, 200)
-        },
-        "saturation": {
-                # Start of Selection
-                "saturation_level": lambda: np.random.uniform(0.8, 0.9) if np.random.rand() < 0.5 else np.random.uniform(1.1, 1.2)
-        },
-        "color_shift": {
-            "shift": lambda: np.random.uniform(-0.1, -0.05, size=3) if np.random.rand() < 0.5 else np.random.uniform(0.05, 0.1, size=3)
-        },
-        "imagecorruptions": {
-            "severity": lambda: np.random.randint(1, 5),
-            # "corruption_name": lambda: np.random.choice(["jpeg_compression"])
-            "corruption_name": lambda: np.random.choice(["gaussian_noise", "shot_noise", "impulse_noise", "defocus_blur", "motion_blur", "zoom_blur", "snow", "frost", "brightness", "contrast", "elastic_transform", "jpeg_compression"])
-        }
-    }
-    # TODO(@giannisdaras): de-anonymize this path
-    dataset = SyntheticallyCorruptedImageFolderDataset(path="/scratch/07362/gdaras/datasets/ffhq-256x256_train_split", 
-                                                        corruption_probability=1.0, 
-                                                        corruptions_dict=corruptions_dict)
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
-    save_images(next(iter(dataloader))["image"] * 2 - 1, "test_synthetically_corrupted.png")
+    # get top-K images
+    sorted_indices = inner_products.squeeze(1, 2).argsort(dim=0)
+    sorted_indices = sorted_indices[:K] if BEST else sorted_indices[-K:]
+    top_K_images = image[sorted_indices].squeeze(1)
+    top_K_texts = [text[i] for i in sorted_indices]
+    save_images(top_K_images * 2 - 1, "test_top_K_images.png")
+    import pdb; pdb.set_trace()
+    # # demonstration of how to use the synthetically corrupted image folder dataset
+
+    # corruptions_dict = {
+    #     "blur": {
+    #         "sigma": lambda: np.random.uniform(0.5, 8.0)
+    #     },
+    #     "mask": {
+    #         "masking_probability": lambda: np.random.uniform(0.05, 0.9)
+    #     },
+    #     "pixelate": {
+    #         "pixel_size": lambda: np.random.randint(10, 200)
+    #     },
+    #     "saturation": {
+    #             # Start of Selection
+    #             "saturation_level": lambda: np.random.uniform(0.8, 0.9) if np.random.rand() < 0.5 else np.random.uniform(1.1, 1.2)
+    #     },
+    #     "color_shift": {
+    #         "shift": lambda: np.random.uniform(-0.1, -0.05, size=3) if np.random.rand() < 0.5 else np.random.uniform(0.05, 0.1, size=3)
+    #     },
+    #     "imagecorruptions": {
+    #         "severity": lambda: np.random.randint(1, 5),
+    #         # "corruption_name": lambda: np.random.choice(["jpeg_compression"])
+    #         "corruption_name": lambda: np.random.choice(["gaussian_noise", "shot_noise", "impulse_noise", "defocus_blur", "motion_blur", "zoom_blur", "snow", "frost", "brightness", "contrast", "elastic_transform", "jpeg_compression"])
+    #     }
+    # }
+    # # TODO(@giannisdaras): de-anonymize this path
+    # dataset = SyntheticallyCorruptedImageFolderDataset(path="/scratch/07362/gdaras/datasets/ffhq-256x256_train_split", 
+    #                                                     corruption_probability=1.0, 
+    #                                                     corruptions_dict=corruptions_dict)
+    # dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
+    # save_images(next(iter(dataloader))["image"] * 2 - 1, "test_synthetically_corrupted.png")

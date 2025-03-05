@@ -31,6 +31,8 @@ def get_classifier_trajectory(
     def process_t(t):
         updated_input = scheduler(input, t) if scheduler is not None else input
         output = model(updated_input, t.unsqueeze(0).repeat(updated_input.shape[0]), **model_kwargs).squeeze()
+        if len(output.shape) == 0:
+            output = output.unsqueeze(0)
         if len(output.shape) == 1:
             if model_output_type == 'logits':
                 # compute sigmoid of output
@@ -60,6 +62,7 @@ def analyze_classifier_trajectory(
     # this essentially finds the first confusion time.
     # if no such time exists, return the last time.
     # the higher the epsilon, the easier the misclassification.
+    assert len(trajectory.shape) == 1, "trajectory must be an 1-D tensor"
     confusion_indices = (0.5 - trajectory + epsilon) > 0
     if confusion_indices.any():
         first_confusion = confusion_indices.nonzero(as_tuple=True)[0][0]
@@ -70,6 +73,7 @@ def analyze_classifier_trajectory(
         "first_confusion": diffusion_times[first_confusion],
     }
     return return_dict
+
 
 
 if __name__ == '__main__':

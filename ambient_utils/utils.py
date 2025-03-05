@@ -288,3 +288,22 @@ def ensure_dimensions(func):
             return func_result.squeeze(0)
         return func_result
     return wrapper
+
+
+def bucketize(values, num_buckets):
+    """
+        Buckets the values into num_buckets buckets.
+        Args:
+            values: (batch_size,)
+            num_buckets: int
+        Returns:
+            bucket_indices: (batch_size,)
+    """
+    # find min and max of values, create num_buckets buckets uniformly between them and split the values into num_buckets arrays
+    min_value = values.min()
+    max_value = values.max()
+
+    # find a value every (max_value - min_value) / num_buckets apart
+    bucket_values = torch.linspace(min_value, max_value, num_buckets + 1, device=values.device)
+    bucket_indices = torch.bucketize(values, bucket_values)
+    return bucket_indices

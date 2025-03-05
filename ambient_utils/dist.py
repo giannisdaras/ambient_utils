@@ -22,9 +22,10 @@ def init():
     if 'WORLD_SIZE' not in os.environ:
         os.environ['WORLD_SIZE'] = '1'
 
-    backend = 'gloo' if os.name == 'nt' else 'nccl'
+    backend = 'gloo' if (os.name == 'nt' or (not torch.cuda.is_available())) else 'nccl'
     torch.distributed.init_process_group(backend=backend, init_method='env://')
-    torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
 
 #----------------------------------------------------------------------------
 

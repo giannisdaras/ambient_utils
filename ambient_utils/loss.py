@@ -39,4 +39,4 @@ def from_x0_pred_to_xnature_pred_vp_to_vp(x0_pred, noisy_input, current_sigma, d
 
 def from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, current_sigma, desired_sigma):
     current_sigma, desired_sigma = [broadcast_batch_tensor(x) for x in [current_sigma, desired_sigma]]
-    return (current_sigma ** 2 - desired_sigma ** 2) / (current_sigma ** 2) * x0_pred + (desired_sigma ** 2 / current_sigma ** 2) * noisy_input
+    return (1 - (desired_sigma / current_sigma) ** 2) * x0_pred + ((desired_sigma / current_sigma) ** 2) * noisy_input

@@ -173,6 +173,7 @@ class Dataset(torch.utils.data.Dataset):
             "image": image.copy(),
             "label": self.get_label(idx),
             "raw_idx": raw_idx,
+            "idx": idx,
             # this fixes a noise realization per image in the dataset. It is useful for ambient training, but can be ignored otherwise.
             "noise": np.random.randn(*image.shape),
             "filename": self._image_fnames[raw_idx],

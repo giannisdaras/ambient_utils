@@ -19,7 +19,7 @@ def get_rel_methods(obj, keyword):
 def broadcast_batch_tensor(batch_tensor):
     """ Takes a tensor of potential shape (batch_size) and returns a tensor of shape (batch_size, 1, 1, 1).
     """
-    return batch_tensor.view(-1, 1, 1, 1)
+    return batch_tensor[:, None, None, None]
 
 
 def ambient_sqrt(x):

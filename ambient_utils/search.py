@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from ambient_utils.loss import from_noise_pred_to_x0_pred_ve
 
 
+# faiss.omp_set_num_threads(os.cpu_count())
+
 print("FAISS using", faiss.omp_get_max_threads(), "threads")
 
 def split_image_into_patches(image: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -240,7 +242,8 @@ class BaseFAISS(ABC):
             indices: tensor of shape [B, n_neighbors]
         """
         self.index.nprobe = nprobe
-        faiss.omp_set_num_threads(os.cpu_count())
+        # faiss.omp_set_num_threads(os.cpu_count())
+
         distances, indices = self.index.search(x_t_np, n_neighbors)
         distances = torch.from_numpy(distances).to(self.device, dtype=self.dtype)
         indices = torch.from_numpy(indices).to(self.device)
@@ -269,7 +272,8 @@ class BaseFAISS(ABC):
         
         # Search for nearest neighbors
         self.index.nprobe = nprobe
-        faiss.omp_set_num_threads(os.cpu_count())
+        # faiss.omp_set_num_threads(os.cpu_count())
+
         distances, indices = self.index.search(generated_np, n_neighbors)  # [B, n_neighbors]
         
         # Convert back to tensors
@@ -321,7 +325,7 @@ class FAISSDiskBased(BaseFAISS):
     def __init__(self, dataset_path: str, 
                  use_gpu: bool = True, index_type: str = 'ivf',
                  index_path: Optional[str] = None, device: torch.device = None,
-                 dtype: torch.dtype = torch.float32, batch_size: int = 1000,
+                 dtype: torch.dtype = torch.float32, batch_size: int = 16,
                  max_clusters: int = 4096, cache_size: int = 8192,
                  patch_size: int = None):
         """
@@ -350,6 +354,7 @@ class FAISSDiskBased(BaseFAISS):
         # Default index path if not provided
         if index_path is None:
             dataset_name = Path(dataset_path).stem
+            base_path = os.environ.get("SCRATCH", "/scratch/07362/gdaras/")
             index_path = f"{base_path}/faiss_index_{dataset_name}_{index_type}_{self.patch_size}.index"
             print(f"Will be saving index to {index_path}")
         self.index_path = index_path
@@ -454,7 +459,7 @@ class FAISSDiskBased(BaseFAISS):
     
     def _build_index_from_disk(self):
         """Build FAISS index by processing dataset in batches from disk."""
-        print(f"Building FAISS index from disk: {self.dataset_path}")
+        print(f"Building FAISS index for dataset: {self.dataset_path}")
         
         # Create dataset object
         dataset = ImageFolderDataset(self.dataset_path, use_labels=False, cache=False, only_positive=False)
@@ -463,8 +468,11 @@ class FAISSDiskBased(BaseFAISS):
         # Initialize index
         num_patches_per_image = (dataset.resolution // self.patch_size)**2
         patch_dim = self.dataset_dim // num_patches_per_image
-        self._create_index(patch_dim, len(dataset) * num_patches_per_image)
+        # faiss.omp_set_num_threads(os.cpu_count())
 
+        self._create_index(patch_dim, len(dataset) * num_patches_per_image)
+        # faiss.omp_set_num_threads(os.cpu_count())
+        # print(f"Using {os.cpu_count()} threads for FAISS")
         
         # Process dataset in batches
         first_batch = True
@@ -491,7 +499,13 @@ class FAISSDiskBased(BaseFAISS):
         # Save index to disk
         if self.index_path:
             print(f"Saving FAISS index to: {self.index_path}")
-            faiss.write_index(self.index, self.index_path)
+            # Check if index is on GPU and move to CPU before saving
+            if hasattr(self.index, 'getDevice') and self.index.getDevice() >= 0:
+                print("Moving index from GPU to CPU for saving...")
+                index_cpu = faiss.index_gpu_to_cpu(self.index)
+                faiss.write_index(index_cpu, self.index_path)
+            else:
+                faiss.write_index(self.index, self.index_path)
     
     def _load_index_from_disk(self):
         """Load existing FAISS index from disk."""
@@ -613,10 +627,12 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
     def __init__(self, dataset_path: str, 
                  use_gpu: bool = True, index_type: str = 'ivf',
                  index_path: Optional[str] = None, device: torch.device = None,
-                 dtype: torch.dtype = torch.float32, batch_size: int = 1000,
+                 dtype: torch.dtype = torch.float32, batch_size: int = 16,
                  max_clusters: int = 4096, cache_size: int = 8192,
                  patch_size: int = None, keep_ratio: float = 0.1):
         self.keep_ratio = keep_ratio
+        # Add mapping to track which patches were actually added to the index
+        self.patch_mapping = None  # Will store (dataset_idx, patch_idx) for each FAISS index entry
 
         super().__init__(dataset_path=dataset_path, 
                               use_gpu=use_gpu, index_type=index_type,
@@ -627,7 +643,7 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
     
     def _build_index_from_disk(self):
         """Build FAISS index by processing dataset in batches from disk."""
-        print(f"Building FAISS index from disk: {self.dataset_path}")
+        print(f"Building FAISS index for dataset: {self.dataset_path}")
         
         # Create dataset object
         dataset = ImageFolderDataset(self.dataset_path, use_labels=False, cache=False, only_positive=False)
@@ -638,23 +654,44 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
         total_patches = int(len(dataset) * (dataset.resolution ** 2) * self.keep_ratio)
 
         real_patch_size = self.patch_size + 1 if self.patch_size % 2 == 0 else self.patch_size
+        # faiss.omp_set_num_threads(os.cpu_count())
 
         self._create_index(real_patch_size ** 2 * 3, total_patches)
+        
+        # faiss.omp_set_num_threads(os.cpu_count())
+        # print(f"Using {os.cpu_count()} threads for FAISS")
 
+        self._move_to_gpu()
+        
+        # Initialize patch mapping
+        self.patch_mapping = []
         
         # Process dataset in batches
         first_batch = True
-        for batch in tqdm(dataloader, desc="Indexing dataset"):   
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Indexing dataset")):   
             # split into patches
 
             batch_patches = split_image_into_pixel_level_patches(batch['image'], self.patch_size)  # B, C, H, W, patch_size, patch_size
 
-            
             batch_patches = batch_patches.permute(0, 2, 3, 1, 4, 5) # B, H, W, C, patch_size, patch_size
             batch_vectors = batch_patches.reshape(batch_patches.shape[0] * batch_patches.shape[1] * batch_patches.shape[2], -1)
+            
+            # Create mapping for this batch
+            batch_size, H, W = batch_patches.shape[:3]
+            for b in range(batch_size):
+                dataset_idx = batch_idx * self.batch_size + b
+                for h in range(H):
+                    for w in range(W):
+                        patch_idx = h * W + w
+                        self.patch_mapping.append((dataset_idx, patch_idx))
+            
             # randomly drop some patches
             if self.keep_ratio < 1:
-                batch_vectors = batch_vectors[torch.rand(batch_vectors.shape[0]) < self.keep_ratio]
+                indices_mask = torch.rand(batch_vectors.shape[0]) < self.keep_ratio
+                batch_vectors = batch_vectors[indices_mask]
+                # Update mapping to only include kept patches
+                kept_indices = torch.where(indices_mask)[0]
+                self.patch_mapping = [self.patch_mapping[i] for i in kept_indices]
 
             if self.index_type == 'ivf' and first_batch:
                 # Train the index with first batch
@@ -672,30 +709,68 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
         # Save index to disk
         if self.index_path:
             print(f"Saving FAISS index to: {self.index_path}")
-            faiss.write_index(self.index, self.index_path)
+            # Check if index is on GPU and move to CPU before saving
+            if hasattr(self.index, 'getDevice') and self.index.getDevice() >= 0:
+                print("Moving index from GPU to CPU for saving...")
+                index_cpu = faiss.index_gpu_to_cpu(self.index)
+                faiss.write_index(index_cpu, self.index_path)
+            else:
+                faiss.write_index(self.index, self.index_path)
+            
+            # Save patch mapping
+            mapping_path = self.index_path.replace('.index', '_mapping.npy')
+            np.save(mapping_path, np.array(self.patch_mapping))
+            print(f"Saved patch mapping to: {mapping_path}")
+
+    def _load_index_from_disk(self):
+        """Load existing FAISS index from disk."""
+        print(f"Loading FAISS index from: {self.index_path}")
+        self.index = faiss.read_index(self.index_path)
+        
+        # Load patch mapping
+        mapping_path = self.index_path.replace('.index', '_mapping.npy')
+        if os.path.exists(mapping_path):
+            mapping_array = np.load(mapping_path)
+            self.patch_mapping = [(int(row[0]), int(row[1])) for row in mapping_array]
+            print(f"Loaded patch mapping from: {mapping_path}")
+        else:
+            print("Warning: No patch mapping found. This may cause issues with keep_ratio < 1.0")
+            self.patch_mapping = None
+        
+        self._move_to_gpu()
 
     def _get_nearest_samples(self, indices: torch.Tensor, C: int, H: int, W: int) -> list:
         """Get nearest samples from disk with caching."""
         B, n_neighbors = indices.shape
-        nearest_samples = []
+        nearest_samples = np.zeros((B, n_neighbors, 3, H, W))
         
         for b in tqdm(range(B), desc="Getting nearest samples"):
-            batch_samples = []
+            batch_samples = np.zeros((n_neighbors, 3, H, W))
             for n in range(n_neighbors):
                 # Get sample from cache or load from disk
                 idx = indices[b, n].item()
+                
+                if self.patch_mapping is not None:
+                    # Use the mapping to get the correct dataset and patch indices
+                    dataset_idx, patch_idx = self.patch_mapping[idx]
+                else:
+                    # Fallback to original method (assumes keep_ratio = 1.0)
+                    real_dataset_resolution = self._get_dataset().resolution
+                    num_patches_per_image = (real_dataset_resolution) ** 2
+                    dataset_idx, patch_idx = divmod(idx, num_patches_per_image)
+                
                 real_dataset_resolution = self._get_dataset().resolution
                 real_patch_size = self.patch_size + 1 if self.patch_size % 2 == 0 else self.patch_size
-                num_patches_per_image = (real_dataset_resolution) ** 2
-                real_dataset_index, patch_index = divmod(idx, num_patches_per_image)  # originally it is indexing the patches
-                sample = self._get_cached_sample_image(real_dataset_index, C, real_dataset_resolution, real_dataset_resolution)
+                sample = self._get_cached_sample_image(dataset_idx, C, real_dataset_resolution, real_dataset_resolution)
+                
                 # now find the patch inside the sample
                 sample_tensor = torch.from_numpy(sample)
                 sample_tensor_patched = split_image_into_pixel_level_patches(sample_tensor.unsqueeze(0), real_patch_size)
                 sample_tensor_patched_flattened = sample_tensor_patched.permute(0, 2, 3, 1, 4, 5).reshape(-1, real_patch_size ** 2 * 3)
-                selected_patch = sample_tensor_patched_flattened[patch_index].reshape(3, real_patch_size, real_patch_size)
-                batch_samples.append(selected_patch.numpy())
-            nearest_samples.append(batch_samples)
+                
+                selected_patch = sample_tensor_patched_flattened[patch_idx].view(3, real_patch_size, real_patch_size)
+                batch_samples[n] = selected_patch.numpy()
+            nearest_samples[b] = batch_samples
         
         return nearest_samples
 
@@ -708,7 +783,7 @@ class CropScore():
     def __init__(self, dataset_path: str, 
                  use_gpu: bool = True, index_type: str = 'ivf',
                  index_path: Optional[str] = None, device: torch.device = None,
-                 dtype: torch.dtype = torch.float32, batch_size: int = 1000,
+                 dtype: torch.dtype = torch.float32, batch_size: int = 16,
                  max_clusters: int = 4096, cache_size: int = 8192,
                  patch_size: int = None):
         """
@@ -807,7 +882,7 @@ class CropScorePixelLevel():
     def __init__(self, dataset_path: str, 
                  use_gpu: bool = True, index_type: str = 'ivf',
                  index_path: Optional[str] = None, device: torch.device = None,
-                 dtype: torch.dtype = torch.float32, batch_size: int = 1000,
+                 dtype: torch.dtype = torch.float32, batch_size: int = 16,
                  max_clusters: int = 4096, cache_size: int = 8192,
                  patch_size: int = None, keep_ratio: float = 0.1):
         """
@@ -903,34 +978,39 @@ if __name__ == "__main__":
     base_path = os.environ.get("SCRATCH", "/scratch/07362/gdaras/")
     image_path = "/scratch/07362/gdaras/datasets/afhqv2-64x64/00000/img00000000.png"
     image_path = "/home1/07362/gdaras/freefusion/images/ood_cat.png"
-    patch_size = 16
+    patch_size = 4
     keep_ratio = 0.1
+    n_probe = 10
+    n_neighbors = 64
+    sigma_value = 0.2
+    batch_size = 2048
+    max_clusters = 8096  # it needs to be sqrt(number_of_training_points)
+
+    test_mode = "crop_score_pixel_level" # choose between disk_based, disk_based_pixel_level, scrop_score, crop_score_pixel_level
     test_image = ambient_utils.load_image(image_path, device=torch.device("cpu"))[:, :3] * 2 - 1
-    n_probe = 1
-    # test_mode = "crop_score_pixel_level" # choose between disk_based, disk_based_pixel_level, scrop_score, crop_score_pixel_level
-    test_mode = "crop_score_pixel_level"
+
     if test_mode == "disk_based":
         faiss_disk = FAISSDiskBased(dataset_path=os.path.join(base_path, "datasets/afhqv2-64x64"), 
                                     use_gpu=True, index_type='ivf', 
                                     index_path=os.path.join(base_path, f"datasets/faiss_index_afhqv2-64x64_ivf_{patch_size}.index"),
-                                    max_clusters=128, patch_size=patch_size)    
+                                    max_clusters=max_clusters, patch_size=patch_size, batch_size=batch_size)    
 
         # get the central patch of size patch_size
         top_left_patch = test_image[:, :, :patch_size, :patch_size]
         ambient_utils.save_images(top_left_patch, "top_left_patch.png")
-        _, _, samples = faiss_disk.find_nearest_matches(top_left_patch, n_neighbors=10, nprobe=n_probe)
+        _, _, samples = faiss_disk.find_nearest_matches(top_left_patch, n_neighbors=n_neighbors, nprobe=n_probe)
         samples = torch.from_numpy(np.stack(samples[0]))  # Stack the neighbors for the first batch item
         ambient_utils.save_images(samples, "nearest_samples.png")
     elif test_mode == "crop_score":
-        sigma_t = torch.tensor(0.2).unsqueeze(0)
+        sigma_t = torch.tensor(sigma_value).unsqueeze(0)
         crop_score = CropScore(dataset_path=os.path.join(base_path, "datasets/afhqv2-64x64"), 
                                 use_gpu=True, index_type='ivf', 
                                 index_path=os.path.join(base_path, f"datasets/faiss_index_afhqv2-64x64_ivf_{patch_size}.index"),
-                                max_clusters=128, patch_size=patch_size, device=torch.device("cpu"))    
+                                max_clusters=128, patch_size=patch_size, device=torch.device("cpu"), batch_size=batch_size)    
         noisy_test_image = test_image + sigma_t * torch.randn_like(test_image)
-        ambient_utils.save_images(noisy_test_image, f"noisy_test_image_{patch_size}.png")
+        ambient_utils.save_images(noisy_test_image, f"noisy_test_image.png")
         denoised = crop_score(noisy_test_image, sigma_t=sigma_t)
-        ambient_utils.save_images(denoised, f"denoised_{patch_size}.png")
+        ambient_utils.save_images(denoised, f"denoised_patch_size_{patch_size}_sigma_{sigma_value}.png")
     elif test_mode == "disk_based_pixel_level":
         test_image_patches = split_image_into_pixel_level_patches(test_image, patch_size)
         patch_level_of_interest = test_image_patches[:, :, 16, 16]
@@ -938,23 +1018,26 @@ if __name__ == "__main__":
         faiss_disk = FAISSDiskBasedPixelLevel(dataset_path=os.path.join(base_path, "datasets/afhqv2-64x64"), 
                                              use_gpu=True, index_type='ivf', 
                                              index_path=os.path.join(base_path, f"datasets/faiss_pixel_level_index_afhqv2-64x64_ivf_patch_size_{patch_size}_keep_ratio_{keep_ratio}.index"),
-                                             max_clusters=128, patch_size=patch_size, keep_ratio=keep_ratio)    
+                                             max_clusters=max_clusters, patch_size=patch_size, keep_ratio=keep_ratio, batch_size=batch_size)    
 
-        _, _,samples = faiss_disk.find_nearest_matches(patch_level_of_interest, n_neighbors=10, nprobe=n_probe)
+        _, _,samples = faiss_disk.find_nearest_matches(patch_level_of_interest, n_neighbors=n_neighbors, nprobe=n_probe)
         samples = torch.from_numpy(np.stack(samples[0]))
         ambient_utils.save_images(samples, "nearest_samples.png")
     elif test_mode == "crop_score_pixel_level":
-        sigma_t = torch.tensor(0.1).unsqueeze(0)
+        sigma_t = torch.tensor(sigma_value).unsqueeze(0)
         crop_score = CropScorePixelLevel(dataset_path=os.path.join(base_path, "datasets/afhqv2-64x64"), 
                                 use_gpu=True, index_type='ivf', 
                                 index_path=os.path.join(base_path, f"datasets/faiss_pixel_level_index_afhqv2-64x64_ivf_patch_size_{patch_size}_keep_ratio_{keep_ratio}.index"),
-                                max_clusters=128, patch_size=patch_size, device=torch.device("cpu"),
-                                cache_size=128,
-                                keep_ratio=keep_ratio)    
-        noisy_test_image = test_image + sigma_t * torch.randn_like(test_image)
-        ambient_utils.save_images(noisy_test_image, f"noisy_test_image_{patch_size}.png")
-        denoised = crop_score(noisy_test_image, sigma_t=sigma_t, nprobe=n_probe)
-        ambient_utils.save_images(denoised, f"denoised_{patch_size}.png")
+                                max_clusters=max_clusters, patch_size=patch_size, device=torch.device("cpu"),
+                                cache_size=128, batch_size=batch_size,
+                                keep_ratio=keep_ratio)
+        noisy_test_image = test_image + sigma_t * torch.randn_like( test_image)
+        ambient_utils.save_images(noisy_test_image, f"noisy_test_image.png")
+        denoised = crop_score(noisy_test_image, sigma_t=sigma_t, nprobe=n_probe, n_neighbors=n_neighbors)
+        ambient_utils.save_images(denoised, f"denoised_patch_size_{patch_size}_sigma_{sigma_value}.png")
+        print("Number of patches in the index: ", crop_score.faiss_disk.index.ntotal)
+        print("Number of clusters in the index: ", crop_score.faiss_disk.index.nlist)
+        print("Average cluster size: ", crop_score.faiss_disk.index.ntotal // crop_score.faiss_disk.index.nlist)
     else:
         raise ValueError(f"Invalid test mode: {test_mode}")
 

@@ -632,7 +632,6 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
                  patch_size: int = None, keep_ratio: float = 0.1):
         self.keep_ratio = keep_ratio
         # Add mapping to track which patches were actually added to the index
-        self.patch_mapping = None  # Will store (dataset_idx, patch_idx) for each FAISS index entry
 
         super().__init__(dataset_path=dataset_path, 
                               use_gpu=use_gpu, index_type=index_type,
@@ -664,7 +663,6 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
         self._move_to_gpu()
         
         # Initialize patch mapping
-        self.patch_mapping = []
         
         # Process dataset in batches
         first_batch = True
@@ -676,22 +674,11 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
             batch_patches = batch_patches.permute(0, 2, 3, 1, 4, 5) # B, H, W, C, patch_size, patch_size
             batch_vectors = batch_patches.reshape(batch_patches.shape[0] * batch_patches.shape[1] * batch_patches.shape[2], -1)
             
-            # Create mapping for this batch
-            batch_size, H, W = batch_patches.shape[:3]
-            for b in range(batch_size):
-                dataset_idx = batch_idx * self.batch_size + b
-                for h in range(H):
-                    for w in range(W):
-                        patch_idx = h * W + w
-                        self.patch_mapping.append((dataset_idx, patch_idx))
             
             # randomly drop some patches
             if self.keep_ratio < 1:
                 indices_mask = torch.rand(batch_vectors.shape[0]) < self.keep_ratio
                 batch_vectors = batch_vectors[indices_mask]
-                # Update mapping to only include kept patches
-                kept_indices = torch.where(indices_mask)[0]
-                self.patch_mapping = [self.patch_mapping[i] for i in kept_indices]
 
             if self.index_type == 'ivf' and first_batch:
                 # Train the index with first batch
@@ -717,26 +704,12 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
             else:
                 faiss.write_index(self.index, self.index_path)
             
-            # Save patch mapping
-            mapping_path = self.index_path.replace('.index', '_mapping.npy')
-            np.save(mapping_path, np.array(self.patch_mapping))
-            print(f"Saved patch mapping to: {mapping_path}")
 
     def _load_index_from_disk(self):
         """Load existing FAISS index from disk."""
         print(f"Loading FAISS index from: {self.index_path}")
         self.index = faiss.read_index(self.index_path)
-        
-        # Load patch mapping
-        mapping_path = self.index_path.replace('.index', '_mapping.npy')
-        if os.path.exists(mapping_path):
-            mapping_array = np.load(mapping_path)
-            self.patch_mapping = [(int(row[0]), int(row[1])) for row in mapping_array]
-            print(f"Loaded patch mapping from: {mapping_path}")
-        else:
-            print("Warning: No patch mapping found. This may cause issues with keep_ratio < 1.0")
-            self.patch_mapping = None
-        
+                
         self._move_to_gpu()
 
     def _get_nearest_samples(self, indices: torch.Tensor, C: int, H: int, W: int) -> list:
@@ -750,14 +723,9 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
                 # Get sample from cache or load from disk
                 idx = indices[b, n].item()
                 
-                if self.patch_mapping is not None:
-                    # Use the mapping to get the correct dataset and patch indices
-                    dataset_idx, patch_idx = self.patch_mapping[idx]
-                else:
-                    # Fallback to original method (assumes keep_ratio = 1.0)
-                    real_dataset_resolution = self._get_dataset().resolution
-                    num_patches_per_image = (real_dataset_resolution) ** 2
-                    dataset_idx, patch_idx = divmod(idx, num_patches_per_image)
+                real_dataset_resolution = self._get_dataset().resolution
+                num_patches_per_image = (real_dataset_resolution) ** 2
+                dataset_idx, patch_idx = divmod(idx, num_patches_per_image)
                 
                 real_dataset_resolution = self._get_dataset().resolution
                 real_patch_size = self.patch_size + 1 if self.patch_size % 2 == 0 else self.patch_size

@@ -13,9 +13,6 @@ import torch.nn.functional as F
 from ambient_utils.loss import from_noise_pred_to_x0_pred_ve
 
 
-# faiss.omp_set_num_threads(os.cpu_count())
-
-print("FAISS using", faiss.omp_get_max_threads(), "threads")
 
 def split_image_into_patches(image: torch.Tensor, patch_size: int) -> torch.Tensor:
     """
@@ -30,7 +27,7 @@ def split_image_into_patches(image: torch.Tensor, patch_size: int) -> torch.Tens
     patches = patches.permute(0, 2, 3, 1, 4, 5)
     return patches
 
-def split_image_into_pixel_level_patches(image: torch.Tensor, patch_size: int) -> torch.Tensor:
+def split_image_into_pixel_level_patches(image: torch.Tensor, patch_size: int, keep_ratio: float = 1.0) -> torch.Tensor:
     """
     Split an image into pixel-level patches.
     
@@ -53,12 +50,21 @@ def split_image_into_pixel_level_patches(image: torch.Tensor, patch_size: int) -
     # Pad the image to handle edge cases
     # Use reflection padding to avoid artifacts at edges
     padded_image = F.pad(image, (half_patch, half_patch, half_patch, half_patch), mode='reflect')
+
     
     # Use unfold to extract all patches at once
     # First unfold in height dimension
     patches_h = padded_image.unfold(2, patch_size, 1)  # [B, C, H, W, patch_size]
+
+    dropped_h = torch.rand(patches_h.shape[2]) < keep_ratio 
+    patches_h = patches_h[:, :, dropped_h, :]
+
+
     # Then unfold in width dimension
     patches = patches_h.unfold(3, patch_size, 1)  # [B, C, H, W, patch_size, patch_size]
+
+    dropped_w = torch.rand(patches.shape[3]) < keep_ratio 
+    patches = patches[:, :, :, dropped_w]
     
     # Rearrange dimensions to match expected output format
     patches = patches.permute(0, 1, 2, 3, 4, 5)  # [B, C, H, W, patch_size, patch_size]
@@ -168,7 +174,6 @@ class BaseFAISS(ABC):
         try:
             # Check if index is already on GPU
             if hasattr(self.index, 'getDevice') and self.index.getDevice() >= 0:
-                print("FAISS index is already on GPU")
                 return
                 
             # Create GPU resources
@@ -184,9 +189,7 @@ class BaseFAISS(ABC):
             ]
             
             for i, config in enumerate(configs_to_try):
-                try:
-                    print(f"Trying GPU configuration {i+1}/{len(configs_to_try)}: {config}")
-                    
+                try:                    
                     # Configure GPU cloner options
                     co = faiss.GpuClonerOptions()
                     co.useFloat16 = config["useFloat16"]
@@ -198,7 +201,6 @@ class BaseFAISS(ABC):
                     # Verify the move was successful
                     if hasattr(gpu_index, 'getDevice') and gpu_index.getDevice() >= 0:
                         self.index = gpu_index
-                        print(f"Successfully moved FAISS index to GPU with config {i+1}")
                         return
                     else:
                         print(f"GPU move failed verification with config {i+1}")
@@ -391,11 +393,9 @@ class FAISSDiskBased(BaseFAISS):
         num_patches_per_image = (temp_dataset.resolution // self.patch_size)**2
         self.dataset_size = len(temp_dataset) * num_patches_per_image
         self.dataset_dim = (temp_dataset.resolution**2) * temp_dataset.num_channels
-        print(f"Dataset info: {self.dataset_size} samples, {self.dataset_dim} dimensions")
     
     def _build_index_from_disk(self):
         """Build FAISS index by processing dataset in batches from disk."""
-        print(f"Building FAISS index for dataset: {self.dataset_path}")
         
         # Create dataset object
         dataset = ImageFolderDataset(self.dataset_path, use_labels=False, cache=False, only_positive=False)
@@ -408,7 +408,6 @@ class FAISSDiskBased(BaseFAISS):
 
         self._create_index(patch_dim, self.pca_dim)
         # faiss.omp_set_num_threads(os.cpu_count())
-        # print(f"Using {os.cpu_count()} threads for FAISS")
         
         # Process dataset in batches
         first_batch = True
@@ -437,7 +436,6 @@ class FAISSDiskBased(BaseFAISS):
             print(f"Saving FAISS index to: {self.index_path}")
             # Check if index is on GPU and move to CPU before saving
             if hasattr(self.index, 'getDevice') and self.index.getDevice() >= 0:
-                print("Moving index from GPU to CPU for saving...")
                 index_cpu = faiss.index_gpu_to_cpu(self.index)
                 faiss.write_index(index_cpu, self.index_path)
             else:
@@ -466,7 +464,6 @@ class FAISSDiskBased(BaseFAISS):
         
         # Build new index
         self._build_index_from_disk()
-        print("FAISS index built successfully")
 
     
     def _get_neighbor_samples(self, indices: torch.Tensor) -> torch.Tensor:
@@ -509,9 +506,7 @@ class FAISSDiskBased(BaseFAISS):
                 sample_tensor = torch.from_numpy(sample)
                 patch_row = patch_index // (self._get_dataset().resolution // self.patch_size)
                 patch_col = patch_index % (self._get_dataset().resolution // self.patch_size)
-                # print(f"patch_row: {patch_row}, patch_col: {patch_col}")
                 sample_patch = sample_tensor[:, patch_row*self.patch_size:(patch_row+1)*self.patch_size, patch_col*self.patch_size:(patch_col+1)*self.patch_size]
-                # ambient_utils.save_image(sample_patch, f"sample_patch_{idx}.png")
                 batch_samples.append(sample_patch.numpy())
             nearest_samples.append(batch_samples)
         
@@ -538,47 +533,38 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
     
     def _build_index_from_disk(self):
         """Build FAISS index by processing dataset in batches from disk."""
-        print(f"Building FAISS index for dataset: {self.dataset_path}")
         
         # Create dataset object
         dataset = ImageFolderDataset(self.dataset_path, use_labels=False, cache=False, only_positive=False)
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=16)
+        dataloader = DataLoader(dataset, batch_size=min(self.batch_size, len(dataset)), shuffle=False, num_workers=16)
 
 
         real_patch_size = self.patch_size + 1 if (self.patch_size % 2 == 0) else self.patch_size
         dataset_dim = real_patch_size ** 2 * 3
         self._create_index(dataset_dim, self.pca_dim)
-        print("Index creation started. Dataset dim: ", dataset_dim)
-        
-
-        print("Each image is giving: ", int(self.patch_size ** 2 * 3 * self.keep_ratio), "patches")
-
         
         
         # Process dataset in batches
         first_batch = True
         for batch in tqdm(dataloader, desc="Indexing dataset"):   
-            # split into patches
 
-            batch_patches = split_image_into_pixel_level_patches(batch['image'], self.patch_size)  # B, C, H, W, patch_size, patch_size
+
+            batch_patches = split_image_into_pixel_level_patches(batch['image'].to(self.dtype), self.patch_size, self.keep_ratio)  # B, C, H, W, patch_size, patch_size
             real_patch_size = batch_patches.shape[-1]
 
             batch_patches = batch_patches.permute(0, 2, 3, 1, 4, 5) # B, H, W, C, patch_size, patch_size
-
             batch_patches = batch_patches.reshape(batch_patches.shape[0] * batch_patches.shape[1] * batch_patches.shape[2], -1) # B * H * W, C * patch_size * patch_size
-            dropped_patches_mask = torch.rand(batch_patches.shape[0]) < self.keep_ratio # B * H * W
-            survived_batch_patches = batch_patches[dropped_patches_mask] 
 
 
             if self.index_type == 'ivf' and first_batch:
                 # Train the index with first batch
                 print("Training disk-based FAISS index...")
                 self._move_to_gpu()
-                self.index.train(survived_batch_patches)
+                self.index.train(batch_patches)
                 first_batch = False
             
             # Add vectors to index
-            self.index.add(survived_batch_patches)
+            self.index.add(batch_patches)
             
         
         # Move to GPU if requestedpa
@@ -589,7 +575,6 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
             print(f"Saving FAISS index to: {self.index_path}")
             # Check if index is on GPU and move to CPU before saving
             if hasattr(self.index, 'getDevice') and self.index.getDevice() >= 0:
-                print("Moving index from GPU to CPU for saving...")
                 index_cpu = faiss.index_gpu_to_cpu(self.index)
                 faiss.write_index(index_cpu, self.index_path)
             else:
@@ -609,12 +594,7 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
         nearest_samples = np.zeros((B, n_neighbors, 3, H, W))
         # print("number of things in index: ", self.index.ntotal)
         cpu_index = faiss.index_gpu_to_cpu(self.index)
-
-        
-        print("Making direct map...")
         cpu_index.make_direct_map()
-        print("Direct map made.")
-
         nearest_samples = cpu_index.reconstruct_batch(indices.reshape(-1)).reshape(B, n_neighbors, 3, H, W)
         return nearest_samples
         
@@ -836,8 +816,8 @@ if __name__ == "__main__":
     dataset_size = 16_000
 
 
-    patch_size = 8
-    keep_ratio = 0.2
+    patch_size = 64
+    keep_ratio = 0.1
     n_probe = 12
     n_neighbors = 64
     sigma_value = 0.2
@@ -895,7 +875,7 @@ if __name__ == "__main__":
                                 index_path=os.path.join(base_path, f"datasets/faiss/faiss_pixel_level_index_{dataset_name}-{dataset_resolution}x{dataset_resolution}_ivf_patch_size_{patch_size}.index"),
                                 num_clusters=num_clusters, patch_size=patch_size, device=torch.device("cpu"),
                                 batch_size=batch_size,
-                                keep_ratio=keep_ratio, pca_dim=pca_dim)
+                                keep_ratio=keep_ratio, pca_dim=pca_dim, dtype=torch.float16)
         noisy_test_image = test_image + sigma_t * torch.randn_like( test_image)
         ambient_utils.save_images(noisy_test_image, f"noisy_test_image.png")
         denoised = crop_score(noisy_test_image, sigma_t=sigma_t, nprobe=n_probe, n_neighbors=n_neighbors)

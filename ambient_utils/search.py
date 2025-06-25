@@ -48,7 +48,6 @@ def split_image_into_pixel_level_patches(image: torch.Tensor, patch_size: int) -
     if patch_size % 2 == 0:
         patch_size += 1
     
-    B, C, H, W = image.shape
     half_patch = patch_size // 2
     
     # Pad the image to handle edge cases
@@ -92,7 +91,7 @@ class BaseFAISS(ABC):
     def __init__(self, use_gpu: bool = True, 
                  index_type: str = 'ivf', device: torch.device = None,
                  dtype: torch.dtype = torch.float32,
-                 max_clusters: int = 4096):
+                 num_clusters: int = 4096):
         """
         Initialize base FAISS neighbors search.
         
@@ -107,22 +106,28 @@ class BaseFAISS(ABC):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dtype = dtype
         self.index = None
-        self.max_clusters = max_clusters
+        self.num_clusters = num_clusters
 
 
-    def _create_index(self, dataset_dim: int, dataset_size: int = None):
+    def _create_index(self, dataset_dim: int, pca_dim: int = None):
         """Create FAISS index based on the specified type."""
         if self.index_type == 'flat':
             self.index = faiss.IndexFlatL2(dataset_dim)
         elif self.index_type == 'ivf':
-            nlist = min(self.max_clusters, max(1, dataset_size // 30))
+            nlist = self.num_clusters
             quantizer = faiss.IndexFlatL2(dataset_dim)
             self.index = faiss.IndexIVFFlat(quantizer, dataset_dim, nlist)
         elif self.index_type == 'hnsw':
             self.index = faiss.IndexHNSWFlat(dataset_dim, 32)
         else:
             raise ValueError(f"Unsupported index type: {self.index_type}")
-
+        
+        if pca_dim is not None:
+            pca_matrix = faiss.PCAMatrix(dataset_dim, pca_dim, 0, True)
+            pca_index = faiss.IndexPreTransform(pca_matrix, self.index)
+            # make sure the distances are computed wrt the true images
+            self.index = faiss.IndexRefineFlat(pca_index)
+        
  
     def _check_gpu_availability(self):
         """Check FAISS GPU availability and provide diagnostics."""
@@ -172,10 +177,10 @@ class BaseFAISS(ABC):
             # Try different GPU cloner configurations, starting with safer options
             # The interleaved_layout=True can cause issues with certain index types
             configs_to_try = [
-                {"useFloat16": False, "interleaved_layout": False},  # Safest option
+                {"useFloat16": True, "interleaved_layout": True},    # Most aggressive
                 {"useFloat16": True, "interleaved_layout": False},   # Float16 but no interleaving
                 {"useFloat16": False, "interleaved_layout": True},   # Interleaving but no float16
-                {"useFloat16": True, "interleaved_layout": True},    # Most aggressive
+                {"useFloat16": False, "interleaved_layout": False},  # Safest option
             ]
             
             for i, config in enumerate(configs_to_try):
@@ -272,7 +277,6 @@ class BaseFAISS(ABC):
         
         # Search for nearest neighbors
         self.index.nprobe = nprobe
-        # faiss.omp_set_num_threads(os.cpu_count())
 
         distances, indices = self.index.search(generated_np, n_neighbors)  # [B, n_neighbors]
         
@@ -326,8 +330,8 @@ class FAISSDiskBased(BaseFAISS):
                  use_gpu: bool = True, index_type: str = 'ivf',
                  index_path: Optional[str] = None, device: torch.device = None,
                  dtype: torch.dtype = torch.float32, batch_size: int = 16,
-                 max_clusters: int = 4096, cache_size: int = 8192,
-                 patch_size: int = None):
+                 num_clusters: int = 4096, cache_size: int = 8192,
+                 patch_size: int = None, pca_dim: int = None):
         """
         Initialize FAISS disk-based approximate nearest neighbors search.
         
@@ -340,12 +344,12 @@ class FAISSDiskBased(BaseFAISS):
             dtype: data type for tensors
             batch_size: Batch size for processing dataset during index building
         """
-        super().__init__(use_gpu=use_gpu, index_type=index_type, device=device, dtype=dtype, max_clusters=max_clusters)
+        super().__init__(use_gpu=use_gpu, index_type=index_type, device=device, dtype=dtype, num_clusters=num_clusters)
         
         self.dataset_path = dataset_path
         self.batch_size = batch_size
         self.cache_size = cache_size
-
+        self.pca_dim = pca_dim
         if patch_size is None:
             self.patch_size = self.get_dataset().resolution
         else:
@@ -356,6 +360,8 @@ class FAISSDiskBased(BaseFAISS):
             dataset_name = Path(dataset_path).stem
             base_path = os.environ.get("SCRATCH", "/scratch/07362/gdaras/")
             index_path = f"{base_path}/faiss_index_{dataset_name}_{index_type}_{self.patch_size}.index"
+            print(f"Will be saving index to {index_path}")
+        else:
             print(f"Will be saving index to {index_path}")
         self.index_path = index_path
         
@@ -470,7 +476,7 @@ class FAISSDiskBased(BaseFAISS):
         patch_dim = self.dataset_dim // num_patches_per_image
         # faiss.omp_set_num_threads(os.cpu_count())
 
-        self._create_index(patch_dim, len(dataset) * num_patches_per_image)
+        self._create_index(patch_dim, self.pca_dim)
         # faiss.omp_set_num_threads(os.cpu_count())
         # print(f"Using {os.cpu_count()} threads for FAISS")
         
@@ -480,7 +486,7 @@ class FAISSDiskBased(BaseFAISS):
             # split into patches
 
             batch_patches = split_image_into_patches(batch['image'], self.patch_size)
-            batch_vectors = batch_patches.reshape(batch_patches.shape[0] * batch_patches.shape[2] * batch_patches.shape[3], -1)
+            batch_vectors = batch_patches.reshape(batch_patches.shape[0] * batch_patches.shape[1] * batch_patches.shape[2], -1)
 
 
             if self.index_type == 'ivf' and first_batch:
@@ -531,6 +537,7 @@ class FAISSDiskBased(BaseFAISS):
         # Build new index
         self._build_index_from_disk()
         print("FAISS index built successfully")
+
     
     def _get_neighbor_samples(self, indices: torch.Tensor) -> torch.Tensor:
         """Get neighbor samples from disk with caching."""
@@ -628,8 +635,8 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
                  use_gpu: bool = True, index_type: str = 'ivf',
                  index_path: Optional[str] = None, device: torch.device = None,
                  dtype: torch.dtype = torch.float32, batch_size: int = 16,
-                 max_clusters: int = 4096, cache_size: int = 8192,
-                 patch_size: int = None, keep_ratio: float = 0.1):
+                 num_clusters: int = 4096, cache_size: int = 8192,
+                 patch_size: int = None, keep_ratio: float = 0.1, pca_dim: int = None):
         self.keep_ratio = keep_ratio
         # Add mapping to track which patches were actually added to the index
 
@@ -637,7 +644,7 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
                               use_gpu=use_gpu, index_type=index_type,
                               index_path=index_path, device=device,
                               dtype=dtype, batch_size=batch_size,
-                              max_clusters=max_clusters, cache_size=cache_size,
+                              num_clusters=num_clusters, cache_size=cache_size,
                               patch_size=patch_size)
     
     def _build_index_from_disk(self):
@@ -649,48 +656,43 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=16)
 
 
-        # Initialize index
-        total_patches = int(len(dataset) * (dataset.resolution ** 2) * self.keep_ratio)
-
-        real_patch_size = self.patch_size + 1 if self.patch_size % 2 == 0 else self.patch_size
-        # faiss.omp_set_num_threads(os.cpu_count())
-
-        self._create_index(real_patch_size ** 2 * 3, total_patches)
+        real_patch_size = self.patch_size + 1 if (self.patch_size % 2 == 0) else self.patch_size
+        dataset_dim = real_patch_size ** 2 * 3
+        self._create_index(dataset_dim, self.pca_dim)
+        print("Index creation started. Dataset dim: ", dataset_dim)
         
-        # faiss.omp_set_num_threads(os.cpu_count())
-        # print(f"Using {os.cpu_count()} threads for FAISS")
 
-        self._move_to_gpu()
+        print("Each image is giving: ", int(self.patch_size ** 2 * 3 * self.keep_ratio), "patches")
+
         
-        # Initialize patch mapping
         
         # Process dataset in batches
         first_batch = True
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Indexing dataset")):   
+        for batch in tqdm(dataloader, desc="Indexing dataset"):   
             # split into patches
 
             batch_patches = split_image_into_pixel_level_patches(batch['image'], self.patch_size)  # B, C, H, W, patch_size, patch_size
+            real_patch_size = batch_patches.shape[-1]
 
             batch_patches = batch_patches.permute(0, 2, 3, 1, 4, 5) # B, H, W, C, patch_size, patch_size
-            batch_vectors = batch_patches.reshape(batch_patches.shape[0] * batch_patches.shape[1] * batch_patches.shape[2], -1)
-            
-            
-            # randomly drop some patches
-            if self.keep_ratio < 1:
-                indices_mask = torch.rand(batch_vectors.shape[0]) < self.keep_ratio
-                batch_vectors = batch_vectors[indices_mask]
+
+            batch_patches = batch_patches.reshape(batch_patches.shape[0] * batch_patches.shape[1] * batch_patches.shape[2], -1) # B * H * W, C * patch_size * patch_size
+            dropped_patches_mask = torch.rand(batch_patches.shape[0]) < self.keep_ratio # B * H * W
+            survived_batch_patches = batch_patches[dropped_patches_mask] 
+
 
             if self.index_type == 'ivf' and first_batch:
                 # Train the index with first batch
                 print("Training disk-based FAISS index...")
-                self.index.train(batch_vectors)
+                self._move_to_gpu()
+                self.index.train(survived_batch_patches)
                 first_batch = False
             
             # Add vectors to index
-            self.index.add(batch_vectors)
+            self.index.add(survived_batch_patches)
             
         
-        # Move to GPU if requested
+        # Move to GPU if requestedpa
         self._move_to_gpu()
         
         # Save index to disk
@@ -716,29 +718,26 @@ class FAISSDiskBasedPixelLevel(FAISSDiskBased):
         """Get nearest samples from disk with caching."""
         B, n_neighbors = indices.shape
         nearest_samples = np.zeros((B, n_neighbors, 3, H, W))
+        # print("number of things in index: ", self.index.ntotal)
+        cpu_index = faiss.index_gpu_to_cpu(self.index)
+
+        
+        if not cpu_index.direct_map:
+            print("Making direct map...")
+            cpu_index.make_direct_map()
+            print("Direct map made.")
         
         for b in tqdm(range(B), desc="Getting nearest samples"):
             batch_samples = np.zeros((n_neighbors, 3, H, W))
             for n in range(n_neighbors):
                 # Get sample from cache or load from disk
                 idx = indices[b, n].item()
-                
-                real_dataset_resolution = self._get_dataset().resolution
-                num_patches_per_image = (real_dataset_resolution) ** 2
-                dataset_idx, patch_idx = divmod(idx, num_patches_per_image)
-                
-                real_dataset_resolution = self._get_dataset().resolution
-                real_patch_size = self.patch_size + 1 if self.patch_size % 2 == 0 else self.patch_size
-                sample = self._get_cached_sample_image(dataset_idx, C, real_dataset_resolution, real_dataset_resolution)
-                
-                # now find the patch inside the sample
-                sample_tensor = torch.from_numpy(sample)
-                sample_tensor_patched = split_image_into_pixel_level_patches(sample_tensor.unsqueeze(0), real_patch_size)
-                sample_tensor_patched_flattened = sample_tensor_patched.permute(0, 2, 3, 1, 4, 5).reshape(-1, real_patch_size ** 2 * 3)
-                
-                selected_patch = sample_tensor_patched_flattened[patch_idx].view(3, real_patch_size, real_patch_size)
+                selected_patch = torch.tensor(cpu_index.reconstruct(idx).reshape(3, H, W))
                 batch_samples[n] = selected_patch.numpy()
+                # ambient_utils.save_image(torch.tensor(selected_patch), f"selected_patch_{b}_{n}.png")
+
             nearest_samples[b] = batch_samples
+        
         
         return nearest_samples
 
@@ -752,8 +751,8 @@ class CropScore():
                  use_gpu: bool = True, index_type: str = 'ivf',
                  index_path: Optional[str] = None, device: torch.device = None,
                  dtype: torch.dtype = torch.float32, batch_size: int = 16,
-                 max_clusters: int = 4096, cache_size: int = 8192,
-                 patch_size: int = None):
+                 num_clusters: int = 4096, cache_size: int = 8192,
+                 patch_size: int = None, pca_dim: int = None):
         """
         Initialize CropScore.
         
@@ -775,8 +774,9 @@ class CropScore():
                                          device=device, 
                                          dtype=dtype, 
                                          batch_size=batch_size, 
-                                         max_clusters=max_clusters, 
-                                         cache_size=cache_size)
+                                         num_clusters=num_clusters, 
+                                         cache_size=cache_size,
+                                         pca_dim=pca_dim)
     
 
     def find_neighbors(self, image: torch.Tensor, n_neighbors: int = 10, nprobe: int = 20000) -> torch.Tensor:
@@ -803,7 +803,7 @@ class CropScore():
 
     def __call__(self, x_t: torch.Tensor, 
                 sigma_t: torch.Tensor, temperature: float = 1.0, 
-                n_neighbors: int = 10, nprobe: int = 20000) -> torch.Tensor:
+                n_neighbors: int = 10, nprobe: int = 10) -> torch.Tensor:
         """
         Compute score from nearest neighbors using softmax weighting.
         
@@ -830,6 +830,7 @@ class CropScore():
         # Compute weighted differences
         samples_perm = samples.permute(0, 3, 1, 2, 4, 5, 6).reshape(batch_size * n_neighbors, num_patches_per_row, num_patches_per_col, 3, patch_size, patch_size) # [B * n_neighbors, num_patches_per_row, num_patches_per_col, 3, patch_size, patch_size]
         assembled = assemble_patches(samples_perm).reshape(batch_size, n_neighbors, 3, x_t.shape[2], x_t.shape[3]) # [B, n_neighbors, 3, H, W]
+        
         diffs = assembled - x_t[:, None] # [B, n_neighbors, 3, H, W]
         patched_diffs = split_image_into_patches(diffs.reshape(batch_size * n_neighbors, 3, x_t.shape[2], x_t.shape[3]), self.patch_size)
         weighted_diffs = weights.permute(0, 3, 1, 2).reshape(batch_size * n_neighbors, num_patches_per_row, num_patches_per_col)[:, :, :, None, None, None] * patched_diffs
@@ -851,8 +852,8 @@ class CropScorePixelLevel():
                  use_gpu: bool = True, index_type: str = 'ivf',
                  index_path: Optional[str] = None, device: torch.device = None,
                  dtype: torch.dtype = torch.float32, batch_size: int = 16,
-                 max_clusters: int = 4096, cache_size: int = 8192,
-                 patch_size: int = None, keep_ratio: float = 0.1):
+                 num_clusters: int = 4096, cache_size: int = 8192,
+                 patch_size: int = None, keep_ratio: float = 0.1, pca_dim: int = None):
         """
         Initialize CropScore.
         
@@ -874,9 +875,10 @@ class CropScorePixelLevel():
                                          device=device, 
                                          dtype=dtype, 
                                          batch_size=batch_size, 
-                                         max_clusters=max_clusters, 
+                                         num_clusters=num_clusters, 
                                          cache_size=cache_size,
-                                         keep_ratio=keep_ratio)
+                                         keep_ratio=keep_ratio,
+                                         pca_dim=pca_dim)
     
     
 
@@ -904,7 +906,7 @@ class CropScorePixelLevel():
 
     def __call__(self, x_t: torch.Tensor, 
                 sigma_t: torch.Tensor, temperature: float = 1.0, 
-                n_neighbors: int = 10, nprobe: int = 20000) -> torch.Tensor:
+                n_neighbors: int = 10, nprobe: int = 10) -> torch.Tensor:
         """
         Compute score from nearest neighbors using softmax weighting.
         
@@ -944,24 +946,44 @@ class CropScorePixelLevel():
 
 if __name__ == "__main__":
     base_path = os.environ.get("SCRATCH", "/scratch/07362/gdaras/")
-    image_path = "/scratch/07362/gdaras/datasets/afhqv2-64x64/00000/img00000000.png"
+    # image_path = "/scratch/07362/gdaras/datasets/afhqv2-64x64/00000/img00000000.png"
     image_path = "/home1/07362/gdaras/freefusion/images/ood_cat.png"
-    patch_size = 4
-    keep_ratio = 0.1
+    # image_path = "/scratch/07362/gdaras/datasets/cifar10-32x32/00000/img00000000.png"
+
+    # dataset_path = "datasets/cifar10-32x32"
+    # dataset_name = "cifar10-32x32"
+    # dataset_resolution = 32
+    # dataset_size = 50_000
+
+    dataset_path = "datasets/afhqv2-64x64"
+    dataset_name = "afhqv2-64x64"
+    dataset_resolution = 64
+    dataset_size = 16_000
+
+
+    patch_size = 16
+    keep_ratio = 0.2
     n_probe = 10
     n_neighbors = 64
-    sigma_value = 0.2
-    batch_size = 2048
-    max_clusters = 8096  # it needs to be sqrt(number_of_training_points)
+    sigma_value = 10.0
+    batch_size = 4096
+
+
+
+    num_clusters = int(np.sqrt(dataset_size * dataset_resolution ** 2))  # it needs to be sqrt(number_of_training_points)
+    pca_dim = None
 
     test_mode = "crop_score_pixel_level" # choose between disk_based, disk_based_pixel_level, scrop_score, crop_score_pixel_level
+    # test_mode = "crop_score"
+
+
     test_image = ambient_utils.load_image(image_path, device=torch.device("cpu"))[:, :3] * 2 - 1
 
     if test_mode == "disk_based":
-        faiss_disk = FAISSDiskBased(dataset_path=os.path.join(base_path, "datasets/afhqv2-64x64"), 
+        faiss_disk = FAISSDiskBased(dataset_path=os.path.join(base_path, dataset_path), 
                                     use_gpu=True, index_type='ivf', 
-                                    index_path=os.path.join(base_path, f"datasets/faiss_index_afhqv2-64x64_ivf_{patch_size}.index"),
-                                    max_clusters=max_clusters, patch_size=patch_size, batch_size=batch_size)    
+                                    index_path=os.path.join(base_path, f"datasets/faiss_index_{dataset_name}_ivf_{patch_size}.index"),
+                                    num_clusters=num_clusters, patch_size=patch_size, batch_size=batch_size)    
 
         # get the central patch of size patch_size
         top_left_patch = test_image[:, :, :patch_size, :patch_size]
@@ -971,10 +993,10 @@ if __name__ == "__main__":
         ambient_utils.save_images(samples, "nearest_samples.png")
     elif test_mode == "crop_score":
         sigma_t = torch.tensor(sigma_value).unsqueeze(0)
-        crop_score = CropScore(dataset_path=os.path.join(base_path, "datasets/afhqv2-64x64"), 
+        crop_score = CropScore(dataset_path=os.path.join(base_path, dataset_path), 
                                 use_gpu=True, index_type='ivf', 
-                                index_path=os.path.join(base_path, f"datasets/faiss_index_afhqv2-64x64_ivf_{patch_size}.index"),
-                                max_clusters=128, patch_size=patch_size, device=torch.device("cpu"), batch_size=batch_size)    
+                                index_path=os.path.join(base_path, f"datasets/faiss_index_{dataset_name}_ivf_{patch_size}.index"),
+                                num_clusters=128, patch_size=patch_size, device=torch.device("cpu"), batch_size=batch_size)    
         noisy_test_image = test_image + sigma_t * torch.randn_like(test_image)
         ambient_utils.save_images(noisy_test_image, f"noisy_test_image.png")
         denoised = crop_score(noisy_test_image, sigma_t=sigma_t)
@@ -983,22 +1005,22 @@ if __name__ == "__main__":
         test_image_patches = split_image_into_pixel_level_patches(test_image, patch_size)
         patch_level_of_interest = test_image_patches[:, :, 16, 16]
         ambient_utils.save_images(patch_level_of_interest, "patch_level_of_interest.png")
-        faiss_disk = FAISSDiskBasedPixelLevel(dataset_path=os.path.join(base_path, "datasets/afhqv2-64x64"), 
+        faiss_disk = FAISSDiskBasedPixelLevel(dataset_path=os.path.join(base_path, dataset_path), 
                                              use_gpu=True, index_type='ivf', 
-                                             index_path=os.path.join(base_path, f"datasets/faiss_pixel_level_index_afhqv2-64x64_ivf_patch_size_{patch_size}_keep_ratio_{keep_ratio}.index"),
-                                             max_clusters=max_clusters, patch_size=patch_size, keep_ratio=keep_ratio, batch_size=batch_size)    
+                                             index_path=os.path.join(base_path, f"datasets/faiss_pixel_level_index_{dataset_name}-{dataset_resolution}x{dataset_resolution}_ivf_patch_size_{patch_size}_keep_ratio_{keep_ratio}.index"),
+                                             num_clusters=num_clusters, patch_size=patch_size, keep_ratio=keep_ratio, batch_size=batch_size, pca_dim=pca_dim)    
 
         _, _,samples = faiss_disk.find_nearest_matches(patch_level_of_interest, n_neighbors=n_neighbors, nprobe=n_probe)
         samples = torch.from_numpy(np.stack(samples[0]))
         ambient_utils.save_images(samples, "nearest_samples.png")
     elif test_mode == "crop_score_pixel_level":
         sigma_t = torch.tensor(sigma_value).unsqueeze(0)
-        crop_score = CropScorePixelLevel(dataset_path=os.path.join(base_path, "datasets/afhqv2-64x64"), 
+        crop_score = CropScorePixelLevel(dataset_path=os.path.join(base_path, dataset_path), 
                                 use_gpu=True, index_type='ivf', 
-                                index_path=os.path.join(base_path, f"datasets/faiss_pixel_level_index_afhqv2-64x64_ivf_patch_size_{patch_size}_keep_ratio_{keep_ratio}.index"),
-                                max_clusters=max_clusters, patch_size=patch_size, device=torch.device("cpu"),
+                                index_path=os.path.join(base_path, f"datasets/faiss_pixel_level_index_{dataset_name}-{dataset_resolution}x{dataset_resolution}_ivf_patch_size_{patch_size}_keep_ratio_{keep_ratio}.index"),
+                                num_clusters=num_clusters, patch_size=patch_size, device=torch.device("cpu"),
                                 cache_size=128, batch_size=batch_size,
-                                keep_ratio=keep_ratio)
+                                keep_ratio=keep_ratio, pca_dim=pca_dim)
         noisy_test_image = test_image + sigma_t * torch.randn_like( test_image)
         ambient_utils.save_images(noisy_test_image, f"noisy_test_image.png")
         denoised = crop_score(noisy_test_image, sigma_t=sigma_t, nprobe=n_probe, n_neighbors=n_neighbors)

@@ -10,3 +10,4 @@ scipy
 webdataset
 datasets
 imagecorruptions
+open_clip_torch
